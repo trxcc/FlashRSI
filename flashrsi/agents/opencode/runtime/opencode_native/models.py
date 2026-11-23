@@ -19,6 +19,7 @@ class ModelResult:
     stop_reason: str | None = None
     usage: dict[str, Any] = field(default_factory=dict)
     raw: dict[str, Any] = field(default_factory=dict)
+    history: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)

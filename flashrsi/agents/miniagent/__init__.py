@@ -21,14 +21,14 @@ class MiniAgent(Agent):
 
     name = "miniagent"
     description = "A workspace-driven ReAct harness with optional file editing."
-    _container_dependencies = ("openai", "requests")
+    _container_dependencies = ("openai", "requests", "httpx")
     # agent.yaml loads this as the system prompt; prompts/extract.md serves the
     # evidence summariser and is not the agent's instructions.
     instruction_file = "prompts/system.md"
 
     async def _run(self, prompt: str, working_dir: Path | None = None) -> Trajectory:
         config = self.config
-        timeout = config.get("timeout", 300)
+        timeout = config.get("timeout", 900)
         # files_dir belongs to Agent; logs and the task cwd belong to this run.
         with TemporaryDirectory(prefix="flashrsi-miniagent-") as temporary:
             root = Path(temporary)
@@ -38,7 +38,10 @@ class MiniAgent(Agent):
             # These are the native run() arguments, passed unchanged by _entry.py.
             request = {
                 "question": prompt,
-                "llm_config": config["llm"],
+                "llm_config": {
+                    "request_timeout": config.get("request_timeout", 900),
+                    **config["llm"],
+                },
                 "web_config": config.get("web", {}),
                 "debug_llm_io": config.get("debug_llm_io", False),
                 "max_turns": config.get("max_turns", 10),

@@ -213,7 +213,7 @@ def _run_environment(agent, home, settings, env, deadline):
         "sandbox": copy.deepcopy(settings.get("sandbox_mode")),
         "approval_policy": settings.get("approval_policy"),
         "budget": {
-            "timeout_seconds": agent.config.get("timeout", 300),
+            "timeout_seconds": agent.config.get("timeout", 900),
             **{
                 key: copy.deepcopy(value)
                 for key, value in settings.items()
@@ -294,7 +294,9 @@ async def _version(path, env, cwd):
 
 
 async def run(agent, prompt, working_dir):
-    from . import _runtime_home, _settings, _stop
+    from flashrsi.integrations._container_payload import _plain
+
+    from . import _deepseek_responses, _runtime_home, _settings, _stop
 
     config = agent.config
     secrets = sorted(
@@ -308,7 +310,7 @@ async def run(agent, prompt, working_dir):
     probes = []
     event_error = None
     error = None
-    deadline = asyncio.get_running_loop().time() + config.get("timeout", 300)
+    deadline = asyncio.get_running_loop().time() + config.get("timeout", 900)
 
     async def probe_version(binary, env, cwd):
         path = binary["path"]
@@ -420,11 +422,19 @@ async def run(agent, prompt, working_dir):
                 "sandbox", native.get("sandbox_mode", "workspace-write")
             )
             settings["model"] = config["llm"]["model_name"]
+            llm = _plain(config["llm"])
+            provider = settings["model_providers"]["flashrsi"]
+            llm["base_url"] = provider["base_url"]
+            llm["reasoning_effort"] = settings.get("model_reasoning_effort")
+            if llm.get("request_timeout") is None and llm.get("stream_idle_timeout_ms") is None:
+                llm["request_timeout"] = config.get("request_timeout")
+            llm["_deepseek_responses"] = _deepseek_responses(config)
             request = {
+                "max_turns": config.get("max_turns"),
                 "prompt": prompt,
                 "home": str(home),
                 "cwd": str(cwd),
-                "llm": dict(config["llm"]),
+                "llm": llm,
                 "settings": settings,
                 "environment": env,
             }
@@ -482,7 +492,7 @@ async def run(agent, prompt, working_dir):
                     error or result.get("error_message") or "Python Codex turn failed"
                 )
         except TimeoutError:
-            error = f"Codex timed out after {config.get('timeout', 300):g}s"
+            error = f"Codex timed out after {config.get('timeout', 900):g}s"
         except Exception as exc:
             error = str(exc) or type(exc).__name__
         finally:

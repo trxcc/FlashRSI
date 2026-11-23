@@ -19,32 +19,18 @@ import httpx
 
 from .history import canonical_item
 from .models import Model, validate_model_settings
-
-
-def _lite_tools(tools):
-    """tools/tool_spec.rs::create_tools_json_for_responses_lite."""
-    namespace = {
-        "type": "namespace",
-        "name": "functions",
-        "description": "",
-        "tools": [],
-    }
-    result, index = [], None
-    for tool in copy.deepcopy(tools):
-        if tool["type"] in {"function", "custom"}:
-            namespace["tools"].append(tool)
-        elif tool["type"] == "namespace" and tool["name"] == "functions":
-            if tool.get("description", "").strip():
-                namespace["description"] = tool["description"]
-            namespace["tools"].extend(tool["tools"])
-        else:
-            result.append(tool)
-            continue
-        if index is None:
-            index = len(result)
-    if index is not None and namespace["tools"]:
-        result.insert(index, namespace)
-    return result
+from .response_request import apply_output_options
+from .response_request import lite_tools as _lite_tools
+from .response_stream import (
+    remember_reasoning,
+    with_reasoning_content,
+)
+from .response_stream import (
+    sse_events as _sse_events,
+)
+from .response_stream import (
+    usage as _usage,
+)
 
 
 class ResponseError(RuntimeError):
@@ -57,6 +43,7 @@ class ResponseError(RuntimeError):
         delay=None,
         partial_items=None,
         usage=None,
+        status=None,
     ):
         super().__init__(message)
         self.code = code
@@ -64,6 +51,24 @@ class ResponseError(RuntimeError):
         self.delay = delay
         self.partial_items = partial_items or []
         self.usage = usage or {}
+        self.status = status
+
+    @property
+    def infra_reason(self):
+        if self.status in {402, 429, 500, 502, 503, 504}:
+            return f"http_{self.status}"
+        if self.code == "rate_limit_exceeded":
+            return "rate_limit"
+        if self.code in {"server_is_overloaded", "slow_down"}:
+            return "http_503"
+        if self.code in {
+            "stream",
+            "server_error",
+            "api_error",
+            "internal_server_error",
+        }:
+            return "incomplete_stream"
+        return None
 
 
 class ResponsesClient:
@@ -85,16 +90,25 @@ class ResponsesClient:
             or "https://api.openai.com/v1"
         ).rstrip("/")
         self.url = self.base_url + "/responses"
-        self.request_retries = min(self.provider.get("request_max_retries", 4), 100)
+        self.deepseek = bool(llm.get("_deepseek_responses"))
+        request_retries = llm.get("max_retries")
+        if request_retries is None:
+            request_retries = self.provider.get("request_max_retries", 4)
+        self.request_retries = min(request_retries, 100)
         self.stream_retries = min(self.provider.get("stream_max_retries", 5), 100)
-        self.idle_timeout = self.provider.get("stream_idle_timeout_ms", 300000) / 1000
+        self.idle_timeout = llm.get("request_timeout")
+        if self.idle_timeout is None:
+            self.idle_timeout = (
+                llm.get("stream_idle_timeout_ms")
+                or self.provider.get("stream_idle_timeout_ms", 900000)
+            ) / 1000
         self.turn_state = None
         self._http = None
         self._installation_id = str(uuid4())
 
     async def __aenter__(self):
         self._http = httpx.AsyncClient(
-            timeout=httpx.Timeout(self.idle_timeout), follow_redirects=True
+            timeout=httpx.Timeout(self.idle_timeout, connect=20), follow_redirects=True
         )
         return self
 
@@ -106,40 +120,8 @@ class ResponsesClient:
         """core::ModelClientSession::{build_reasoning,build_responses_request}."""
         info, settings = self.model.info, self.settings
         lite = info["use_responses_lite"]
-        reasoning = {}
-        effort = self.llm.get("reasoning_effort")
-        if effort is None:
-            effort = settings.get("model_reasoning_effort")
-        if effort is None:
-            effort = info.get("default_reasoning_level")
-        if effort is not None:
-            reasoning["effort"] = "max" if effort == "ultra" else effort
-        summary = settings.get("model_reasoning_summary")
-        if summary is None:
-            summary = info["default_reasoning_summary"]
-        if info["supports_reasoning_summary_parameter"] and summary != "none":
-            reasoning["summary"] = summary
-        if lite:
-            reasoning["context"] = "all_turns"
-        # Non-OpenAI providers must not receive internal metadata or encrypted
-        # function args; this is separate from reasoning.encrypted_content.
-        input_items = copy.deepcopy(items)
-        for item in input_items:
-            identity = item.get("id")
-            if identity is not None and not re.fullmatch(
-                r"[^_]+_.+", identity, re.DOTALL
-            ):
-                item.pop("id", None)
-            if not self.is_openai:
-                item.pop("internal_chat_message_metadata_passthrough", None)
-                if item.get("type") == "function_call":
-                    item.pop("encrypted_function_args", None)
-            if lite:
-                for field in ("content", "output"):
-                    if isinstance(item.get(field), list):
-                        for part in item[field]:
-                            if part.get("type") == "input_image":
-                                part.pop("detail", None)
+        reasoning = self._reasoning(lite)
+        input_items = self._request_items(items, lite)
         payload = {
             "model": info["slug"],
             "input": input_items,
@@ -171,6 +153,73 @@ class ResponsesClient:
                 "x-codex-window-id": self.thread_id + ":0",
             },
         }
+        self._apply_request_options(payload, input_items, tools, lite)
+        return payload
+
+    def _reasoning(self, lite: bool) -> dict:
+        info, settings = self.model.info, self.settings
+        reasoning = {}
+        effort = self.llm.get("reasoning_effort")
+        if effort is None:
+            effort = settings.get("model_reasoning_effort")
+        if effort is None:
+            effort = info.get("default_reasoning_level")
+        if effort is not None:
+            reasoning["effort"] = "max" if effort == "ultra" else effort
+        summary = settings.get("model_reasoning_summary")
+        if summary is None:
+            summary = info["default_reasoning_summary"]
+        if info["supports_reasoning_summary_parameter"] and summary != "none":
+            reasoning["summary"] = summary
+        if lite:
+            reasoning["context"] = "all_turns"
+        return reasoning
+
+    def _request_items(self, items: list, lite: bool) -> list:
+        # Non-OpenAI providers must not receive internal metadata or encrypted
+        # function args; this is separate from reasoning.encrypted_content.
+        input_items = copy.deepcopy(items)
+        for item in input_items:
+            identity = item.get("id")
+            if identity is not None and not re.fullmatch(
+                r"[^_]+_.+", identity, re.DOTALL
+            ):
+                item.pop("id", None)
+            if not self.is_openai:
+                item.pop("internal_chat_message_metadata_passthrough", None)
+                if item.get("type") == "function_call":
+                    item.pop("encrypted_function_args", None)
+            if lite:
+                for field in ("content", "output"):
+                    if isinstance(item.get(field), list):
+                        for part in item[field]:
+                            if part.get("type") == "input_image":
+                                part.pop("detail", None)
+        return input_items
+
+    def _apply_request_options(
+        self, payload: dict, input_items: list, tools: list, lite: bool
+    ) -> None:
+        info, settings = self.model.info, self.settings
+        reasoning = payload["reasoning"]
+        output_tokens = self.llm.get("max_output_tokens") or self.llm.get("max_tokens")
+        if output_tokens is not None:
+            payload["max_output_tokens"] = output_tokens
+        if self.deepseek:
+            thinking = self.llm.get("thinking")
+            if thinking is None:
+                thinking = (self.llm.get("extra_body") or {}).get("thinking")
+            mode = thinking.get("type") if isinstance(thinking, dict) else thinking
+            if mode is False or mode in ("disabled", "off", "none"):
+                payload["reasoning"] = {"effort": "none"}
+            else:
+                payload["reasoning"] = {"effort": reasoning.get("effort", "high")}
+            if output_tokens is None and info["slug"] == "deepseek-flash":
+                payload["max_output_tokens"] = 65536
+            for item in input_items:
+                if item["type"] == "reasoning":
+                    item.pop("summary", None)
+                    item.pop("encrypted_content", None)
         if self.model.instructions:
             payload["instructions"] = self.model.instructions
         if lite:
@@ -198,38 +247,9 @@ class ResponsesClient:
             payload["input"] = prefix + input_items
             payload.pop("instructions", None)
             payload.pop("tools", None)
-        verbosity = (
-            settings.get("model_verbosity") or info.get("default_verbosity")
-            if info["support_verbosity"]
-            else None
+        apply_output_options(
+            payload, settings, info, reasoning, is_openai=self.is_openai
         )
-        text = {}
-        if verbosity is not None:
-            text["verbosity"] = verbosity
-        if settings.get("output_schema") is not None:
-            text["format"] = {
-                "type": "json_schema",
-                "strict": settings.get("output_schema_strict", True),
-                "schema": settings["output_schema"],
-                "name": "codex_output_schema",
-            }
-        if text:
-            payload["text"] = text
-        service_tier = settings.get("service_tier")
-        if service_tier != "default" and any(
-            tier["id"] == service_tier for tier in info["service_tiers"]
-        ):
-            payload["service_tier"] = service_tier
-        features = settings.get("features", {})
-        if (
-            features.get("concurrent_reasoning_summaries")
-            and self.is_openai
-            and "summary" in reasoning
-        ):
-            payload["stream_options"] = {
-                "reasoning_summary_delivery": "sequential_cutoff"
-            }
-        return payload
 
     @property
     def is_openai(self):
@@ -373,8 +393,8 @@ class ResponsesClient:
                 )
 
     async def _request_with_retry(self, payload, headers):
-        # codex-client/src/retry.rs::run_with_retry. Provider retry_429=false;
-        # Retry-After headers do not override this transport retry policy.
+        # DeepSeek rate limits are transient. Keep other providers' existing
+        # request retry policy.
         for attempt in range(self.request_retries + 1):
             try:
                 async with self._http.stream(
@@ -388,11 +408,15 @@ class ResponsesClient:
                         body = (await response.aread()).decode(errors="replace")
                         if (
                             response.status_code >= 500
-                            and attempt < self.request_retries
-                        ):
+                            or (self.deepseek and response.status_code == 429)
+                        ) and attempt < self.request_retries:
                             await asyncio.sleep(_backoff(attempt + 1))
                             continue
-                        raise _http_error(response.status_code, body)
+                        error = _http_error(response.status_code, body)
+                        if self.deepseek and error.infra_reason:
+                            # The request layer has used its retry budget.
+                            error.retryable = False
+                        raise error
                     self.turn_state = self.turn_state or response.headers.get(
                         "x-codex-turn-state"
                     )
@@ -406,6 +430,7 @@ class ResponsesClient:
 
     async def _reduce(self, response):
         items, pending_error = [], None
+        reasoning_text = {}
         stream = _sse_events(response).__aiter__()
         while True:
             try:
@@ -431,8 +456,15 @@ class ResponsesClient:
             if not isinstance(event, dict) or not isinstance(event.get("type"), str):
                 continue
             kind = event["type"]
+            if self.deepseek:
+                remember_reasoning(event, reasoning_text)
             if kind == "response.output_item.done":
-                item = canonical_item(event.get("item"))
+                item = event.get("item")
+                if self.deepseek:
+                    item = with_reasoning_content(
+                        item, reasoning_text.get(event.get("output_index"))
+                    )
+                item = canonical_item(item)
                 if item is None:
                     continue
                 event["item"] = item
@@ -449,7 +481,9 @@ class ResponsesClient:
                     (event.get("response") or {}).get("incomplete_details") or {}
                 ).get("reason", "unknown")
                 pending_error = ResponseError(
-                    "Incomplete response returned, reason: " + str(reason)
+                    "Incomplete response returned, reason: " + str(reason),
+                    code=str(reason) if self.deepseek else "stream",
+                    retryable=not self.deepseek,
                 )
             elif kind == "response.completed" and event.get("response") is not None:
                 completed = event["response"]
@@ -473,53 +507,6 @@ class ResponsesClient:
                     "response_id": completed["id"],
                     "end_turn": completed.get("end_turn"),
                 }
-
-
-async def _sse_events(response):
-    """SSE framing equivalent to eventsource_stream, across arbitrary chunks."""
-    data = []
-    first = True
-    async for line in response.aiter_lines():
-        if first:
-            line, first = line.removeprefix("\ufeff"), False
-        if not line:
-            if data:
-                yield "\n".join(data)
-                data = []
-            continue
-        if line.startswith(":"):
-            continue
-        field, _, value = line.partition(":")
-        if field == "data":
-            data.append(value.removeprefix(" "))
-
-
-def _usage(usage):
-    # sse/responses.rs::From<ResponseCompletedUsage> for TokenUsage.
-    if usage is None:
-        return {}
-    result = {
-        key: usage[key] for key in ("input_tokens", "output_tokens", "total_tokens")
-    }
-    details = usage.get("input_tokens_details")
-    output_details = usage.get("output_tokens_details")
-    result.update(
-        cached_input_tokens=details["cached_tokens"] if details is not None else 0,
-        cache_write_input_tokens=details.get("cache_write_tokens", 0)
-        if details is not None
-        else 0,
-        reasoning_output_tokens=output_details["reasoning_tokens"]
-        if output_details is not None
-        else 0,
-    )
-    if any(
-        type(value) is not int or not -(2**63) <= value < 2**63
-        for value in result.values()
-    ):
-        raise ValueError("token usage fields must be 64-bit integers")
-    if usage.get("codex_rollout_budget_units") is not None:
-        result["codex_rollout_budget_units"] = usage["codex_rollout_budget_units"]
-    return result
 
 
 def _stream_error(error):
@@ -553,11 +540,14 @@ def _http_error(status, body):
     except (ValueError, AttributeError):
         error = {}
     code = error.get("code", "") if isinstance(error, dict) else ""
-    fatal = status in {400, 429} or (
+    fatal = 400 <= status < 500 or (
         status == 503 and code in {"server_is_overloaded", "slow_down"}
     )
     return ResponseError(
-        f"HTTP {status}: {body}", code=code or f"http_{status}", retryable=not fatal
+        f"HTTP {status}: {body}",
+        code=code or f"http_{status}",
+        retryable=not fatal,
+        status=status,
     )
 
 

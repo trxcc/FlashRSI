@@ -747,9 +747,12 @@ async def run_session(request, emit):
                 "source": str(Path(__file__).parent),
             }
         )
-        retries = 0
+        retries = turns = 0
+        max_turns = request.get("max_turns")
         can_drain_pending_input = request.get("_initial_input_items") == []
         while True:
+            if max_turns is not None and turns >= max_turns:
+                raise RuntimeError(f"Codex reached max_turns ({max_turns})")
             flush_injections()
             if can_drain_pending_input:
                 drain_input()
@@ -815,6 +818,7 @@ async def run_session(request, emit):
                     exc.delay if exc.delay is not None else _backoff(retries)
                 )
                 continue
+            turns += 1
             history.add_usage(response["usage"])
             observe_usage(history, response["usage"], settings)
             await schedule.drain(append)
@@ -854,6 +858,10 @@ async def run_session(request, emit):
                     append(item)
                 continue
             break
+    except ResponseError as exc:
+        status, error = "error", str(exc) or type(exc).__name__
+        if exc.infra_reason:
+            emit({"type": "InfraError", "reason": exc.infra_reason})
     except HookStopped as exc:
         status, error = "interrupted", str(exc) or "Codex turn stopped by hook"
     except asyncio.CancelledError:

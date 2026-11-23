@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
+from flashrsi.core.provider import is_deepseek
+
 from .compaction import (
     calculate_context_tokens,
     content_text,
@@ -15,6 +17,7 @@ from .compaction import (
     js_length,
     model_limits,
     model_metadata,
+    requested_max_tokens,
 )
 from .openai_options import adjust_max_tokens_for_thinking
 
@@ -78,11 +81,14 @@ def estimate_context_tokens(messages: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def clamp_max_tokens(
-    context_window: int, messages: list[dict[str, Any]], max_tokens: int
+    context_window: int, messages: list[dict[str, Any]], max_tokens: int, *, strict=False
 ) -> int:
     if context_window <= 0:
         return max(1, max_tokens)
-    available = context_window - estimate_context_tokens(messages)["tokens"] - 4096
+    remaining = context_window - estimate_context_tokens(messages)["tokens"]
+    if strict and remaining < 1:
+        raise ValueError("Pi input exhausts the context window")
+    available = remaining - 4096
     return min(max_tokens, max(1, available))
 
 
@@ -102,10 +108,7 @@ def anthropic_options(
     level_map = metadata.get("thinkingLevelMap") or {}
     context_window, model_max_tokens = model_limits(config)
     llm = config.get("llm", {})
-    requested = config.get("max_tokens", llm.get("max_tokens", model_max_tokens))
-    if requested is None:
-        requested = model_max_tokens
-    cap = clamp_max_tokens(context_window, messages, int(requested))
+    cap = clamp_max_tokens(context_window, messages, requested_max_tokens(config))
     reasoning = reasoning if metadata.get("reasoning") else None
     if reasoning and reasoning not in {
         "minimal",
@@ -133,7 +136,8 @@ def anthropic_options(
                 reasoning, "high"
             )
     budget = None
-    if reasoning and not adaptive:
+    model = str(llm.get("model_name", "")).rsplit("/", 1)[-1]
+    if reasoning and not adaptive and not is_deepseek(model):
         adjusted = adjust_max_tokens_for_thinking(
             cap,
             model_max_tokens,
@@ -143,8 +147,8 @@ def anthropic_options(
                 config.get("thinkingBudgets", llm.get("thinking_budgets")),
             ),
         )
-        cap, budget = adjusted["maxTokens"], adjusted["thinkingBudget"]
-        cap = clamp_max_tokens(context_window, messages, cap)
+        budget = adjusted["thinkingBudget"]
+        cap = clamp_max_tokens(context_window, messages, adjusted["maxTokens"])
         budget = min(budget, max(0, cap - 1024))
     result: dict[str, Any] = {"max_tokens": cap}
     if compat.get("allowedFallbackModels"):

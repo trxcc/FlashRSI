@@ -27,6 +27,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+from flashrsi.core.infra import InfraError, infra_reason
+
 from . import llm, reader
 from . import web_config as web_settings
 from . import workspace as ws_mod
@@ -204,6 +206,8 @@ def _serialize_assistant(msg) -> dict:
                 }
                 for tc in tcs
             ]
+    if getattr(msg, "anthropic_content", None) is not None:
+        d["anthropic_content"] = msg.anthropic_content
     if "tool_calls" in d and "content" not in d:
         d["content"] = ""
     for k in (
@@ -1043,6 +1047,9 @@ async def run(
 
         if _llm_last_err is not None:
             e = _llm_last_err
+            if reason := infra_reason(e):
+                stop_reason = str(InfraError(reason))
+                break
             http_detail = {}
             for key in ("status_code", "llm_provider", "model"):
                 val = getattr(e, key, None)
@@ -1164,7 +1171,12 @@ async def run(
                 candidate_answer,
                 ctx,
             )
-            messages.append({"role": "assistant", "content": final_answer})
+            if use_responses_api:
+                messages.append({"role": "assistant", "content": final_answer})
+            else:
+                final_message = _serialize_assistant(msg)
+                final_message["content"] = final_answer
+                messages.append(final_message)
             if final_action == "continue" and feedback:
                 messages.append({"role": "user", "content": feedback})
                 if use_responses_api:

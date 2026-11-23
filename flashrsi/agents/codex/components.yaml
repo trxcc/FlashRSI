@@ -14,6 +14,8 @@ code:
   - python_core/models.py
   - python_core/remote_compact.py
   - python_core/resources.py
+  - python_core/response_request.py
+  - python_core/response_stream.py
 prompt:
   # Candidate snapshots may add a root-level instruction file at runtime.
   - AGENTS.md

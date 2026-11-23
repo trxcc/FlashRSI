@@ -11,6 +11,8 @@ import copy
 import re
 from typing import Any, Callable, Mapping
 
+from flashrsi.core.provider import is_deepseek
+
 from .compaction import content_text, model_metadata
 from .constrained_sampling import resolve_strict, strict_parameters
 from .provider_options import anthropic_options
@@ -475,6 +477,13 @@ def build_anthropic_payload(
                 {"role": "system", "content": "", "toolsAdded": tools, "timestamp": 0},
             )
     options, betas, managed = anthropic_options(config, context, reasoning)
+    deepseek = is_deepseek(model)
+    if deepseek:
+        options["thinking"] = {"type": "enabled" if reasoning else "disabled"}
+        if reasoning:
+            options["output_config"] = {"effort": reasoning}
+        betas = [beta for beta in betas if beta != "interleaved-thinking-2025-05-14"]
+        managed = None
     native_system = compat.get("supportsMidConvoSystemMessages") is True
     if not native_system:
         system = current_system_message(context)
@@ -555,7 +564,7 @@ def build_anthropic_payload(
             provider,
             model,
             managed_effort=managed,
-            allow_empty_signature=compat.get("allowEmptySignature", False),
+            allow_empty_signature=compat.get("allowEmptySignature", deepseek),
             supports_images="image" in metadata.get("input", ["text", "image"]),
             native_system_messages=native_system,
             convert_tools=convert if native_tools else None,

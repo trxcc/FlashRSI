@@ -22,7 +22,8 @@ from types import ModuleType
 from typing import Any, Iterator
 
 from flashrsi._records import _redact, _secrets
-from flashrsi.core import Agent, Trajectory
+from flashrsi.core import Agent, InfraError, Trajectory
+from flashrsi.core.infra import infra_reason
 
 _THINKING_LEVELS = {"off", "minimal", "low", "medium", "high", "xhigh", "max"}
 _RUN_CONTROLS = ContextVar("pi_run_controls", default=None)
@@ -89,16 +90,18 @@ class Pi(Agent):
 
     async def _run(self, prompt: str, working_dir: Path | None = None) -> Trajectory:
         config = self.config
-        timeout = config.get("timeout", 300)
+        timeout = config.get("timeout", 900)
         if type(timeout) not in (int, float) or timeout <= 0:
             return Trajectory(
                 status="error", error_message="Pi timeout must be positive"
             )
         try:
             provider, model = _model(config["llm"])
-            _thinking(config)
+            thinking = _thinking(config)
             _runtime(self.files_dir)
             native_config = _plain_config(config)
+            if thinking is not None:
+                native_config["thinking"] = thinking
         except (KeyError, TypeError, ValueError) as exc:
             return Trajectory(status="error", error_message=str(exc))
 
@@ -141,6 +144,8 @@ class Pi(Agent):
                     error_message=f"Pi timed out after {timeout:g}s",
                 )
             except Exception as exc:
+                if reason := infra_reason(exc):
+                    raise InfraError(reason) from None
                 return Trajectory(
                     status="error",
                     error_message=_redact(str(exc), secrets),
@@ -274,6 +279,14 @@ def _thinking(config: Mapping[str, Any]) -> str | None:
             llm.get("thinking", llm.get("reasoning_effort", llm.get("effort"))),
         ),
     )
+    if isinstance(value, Mapping):
+        kind = value.get("type")
+        if kind == "disabled":
+            value = "off"
+        elif kind in {"enabled", "adaptive"}:
+            value = config.get("reasoning_effort", llm.get("reasoning_effort", "high"))
+        else:
+            raise ValueError("Pi thinking.type must be enabled, adaptive or disabled")
     if value == "none":
         value = "off"
     if value is None:

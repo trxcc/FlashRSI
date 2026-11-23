@@ -22,7 +22,8 @@ from types import ModuleType
 from typing import Any, Iterator
 
 from flashrsi._records import _redact, _secrets
-from flashrsi.core import Agent, Trajectory
+from flashrsi.core import Agent, InfraError, Trajectory
+from flashrsi.core.infra import infra_reason
 
 _RUN_CONTROLS: ContextVar[dict[str, Any] | None] = ContextVar(
     "opencode_run_controls", default=None
@@ -73,7 +74,7 @@ class OpenCode(Agent):
                     }
                     result = await asyncio.wait_for(
                         native.run(config, prompt, task_dir, self.files_dir, **options),
-                        timeout=float(config.get("timeout", 300)),
+                        timeout=float(config.get("timeout", 900)),
                     )
             if not isinstance(result, Mapping):
                 result = vars(result)
@@ -94,10 +95,12 @@ class OpenCode(Agent):
             return Trajectory(
                 status="error",
                 error_message=(
-                    f"OpenCode timed out after {self.config.get('timeout', 300):g}s"
+                    f"OpenCode timed out after {self.config.get('timeout', 900):g}s"
                 ),
             )
         except Exception as exc:
+            if reason := infra_reason(exc):
+                raise InfraError(reason) from None
             return Trajectory(status="error", error_message=_redact(str(exc), secrets))
 
 
@@ -163,7 +166,7 @@ def _validate(config: Mapping[str, Any], files_dir: Path | None = None) -> None:
         raise ValueError(
             "OpenCode supports Chat Completions, Responses and Anthropic Messages APIs"
         )
-    timeout = config.get("timeout", 300)
+    timeout = config.get("timeout", 900)
     if (
         isinstance(timeout, bool)
         or not isinstance(timeout, (int, float))

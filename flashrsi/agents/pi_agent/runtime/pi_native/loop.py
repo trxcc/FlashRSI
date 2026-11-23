@@ -24,6 +24,8 @@ from typing import Any, Mapping
 
 import httpx
 
+from flashrsi.core.provider import is_deepseek
+
 from .anthropic_messages import anthropic_response, build_anthropic_payload
 from .branch_summary import navigate
 from .compaction import (
@@ -459,8 +461,16 @@ async def _request_provider(
         parser=parser,
         on_event=on_event,
         cancel_event=cancel_event,
+        require_done=api == "openai-completions" and is_deepseek(payload.get("model")),
         **options,
     )
+
+
+def _apply_extra_body(payload, config, llm):
+    extra = llm.get("extra_body", config.get("extra_body"))
+    if not isinstance(extra, Mapping):
+        return
+    payload.update(extra)
 
 
 async def _openai_call(
@@ -485,9 +495,7 @@ async def _openai_call(
     payload, _ = build_openai_payload(
         config, context, "openai-completions", _reasoning_effort(config, llm), tools
     )
-    extra_body = llm.get("extra_body", config.get("extra_body"))
-    if isinstance(extra_body, Mapping):
-        payload.update(extra_body)
+    _apply_extra_body(payload, config, llm)
     data = await _request_provider(
         client,
         _openai_url(base_url),
@@ -593,9 +601,7 @@ async def _openai_responses_call(
     payload, managed_effort = build_openai_payload(
         config, context, "openai-responses", _reasoning_effort(config, llm), tools
     )
-    extra_body = llm.get("extra_body", config.get("extra_body"))
-    if isinstance(extra_body, Mapping):
-        payload.update(extra_body)
+    _apply_extra_body(payload, config, llm)
     data = await _request_provider(
         client,
         url,
@@ -1059,7 +1065,8 @@ async def _execute_tool_batch(
                 options["cancel_event"] = cancel_event
             if model is not None:
                 options.update(model=model, auto_resize_images=auto_resize_images)
-            if "on_update" in inspect.signature(execute_tool).parameters:
+            parameters = inspect.signature(execute_tool).parameters
+            if "on_update" in parameters:
                 options["on_update"] = update
             return execute_tool(call.get("name", ""), arguments, cwd, **options)
 
@@ -1321,9 +1328,10 @@ async def _run(
     if (
         "timeoutMs" in provider_policy
         and "request_timeout" not in config
-        and "timeout" not in config
     ):
-        config["_provider_timeout"] = provider_policy["timeoutMs"] / 1000
+        config["_provider_timeout"] = httpx.Timeout(
+            provider_policy["timeoutMs"] / 1000, connect=20
+        )
     if "maxRetryDelayMs" in provider_policy:
         config["_provider_retry_delay"] = provider_policy["maxRetryDelayMs"] / 1000
     selected = _selected_tools(config, files_dir)
@@ -1413,7 +1421,7 @@ async def _run(
     )
     if tool_execution not in {"parallel", "sequential"}:
         raise ValueError("Pi tool_execution must be parallel or sequential")
-    timeout = float(config.get("request_timeout", config.get("timeout", 300)))
+    timeout = httpx.Timeout(float(config.get("request_timeout", 900)), connect=20)
     tool_schemas = resources.tool_schemas
     # ``runAgentLoop`` reports the initial user prompt in the new-message list;
     # keep the same transcript shape for callers consuming ``agent_end``.

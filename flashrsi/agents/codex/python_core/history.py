@@ -71,7 +71,7 @@ _ITEM_REQUIRED = {
     "additional_tools": {"role": str, "tools": list},
     "message": {"role": str, "content": list},
     "agent_message": {"author": str, "recipient": str, "content": list},
-    "reasoning": {"summary": list},
+    "reasoning": {},
     "function_call": {"name": str, "arguments": str, "call_id": str},
     "function_call_output": {"call_id": str, "output": (str, list)},
     "custom_tool_call": {"call_id": str, "name": str, "input": str},
@@ -86,7 +86,7 @@ _ITEM_REQUIRED = {
 }
 _ITEM_OPTIONAL = {
     "message": {"phase": str},
-    "reasoning": {"content": list, "encrypted_content": str},
+    "reasoning": {"summary": list, "content": list, "encrypted_content": str},
     "function_call": {"namespace": str, "encrypted_function_args": list},
     "custom_tool_call": {"status": str, "namespace": str},
     "custom_tool_call_output": {"name": str},
@@ -286,7 +286,7 @@ def _canonical_item(item):
         }
     if kind == "reasoning":
         result["summary"] = [
-            _text_part(part, {"summary_text"}) for part in result["summary"]
+            _text_part(part, {"summary_text"}) for part in result.get("summary", [])
         ]
         result.setdefault("encrypted_content", None)
         content = item.get("content")

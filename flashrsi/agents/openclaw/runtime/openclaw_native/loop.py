@@ -260,6 +260,7 @@ async def run(
                 "assistant",
                 result.text or "",
                 **({"tool_calls": assistant_calls} if assistant_calls else {}),
+                **getattr(result, "history", {}),
             )
             messages.append(assistant_message)
             truncated = str(result.stop_reason or "").lower() in {

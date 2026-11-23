@@ -33,8 +33,14 @@ def model_metadata(config: Mapping[str, Any]) -> dict[str, Any]:
         provider, model = name.split("/", 1)
     else:
         provider, model = str(llm.get("provider_name", "")), name
+    if not provider and model == "deepseek-flash":
+        provider = "deepseek"
     name = f"{provider.strip().lower()}/{model.strip()}"
-    return _model_catalog().get(name, {})
+    metadata = _model_catalog().get(name, {})
+    if name == "deepseek/deepseek-flash":
+        # Match the output token cap supported by the DeepSeek API.
+        return {**metadata, "maxTokens": 65536}
+    return metadata
 
 
 def model_limits(config: Mapping[str, Any]) -> tuple[int, int]:
@@ -58,6 +64,16 @@ def model_limits(config: Mapping[str, Any]) -> tuple[int, int]:
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise ValueError(f"Pi {label} must be a non-negative integer")
     return context, output
+
+
+def requested_max_tokens(config: Mapping[str, Any]) -> int:
+    _, ceiling = model_limits(config)
+    requested = config.get("max_tokens", config.get("llm", {}).get("max_tokens"))
+    if requested is None:
+        return ceiling
+    if type(requested) is not int or requested <= 0:
+        raise ValueError("Pi llm.max_tokens must be a positive integer")
+    return requested
 
 
 def js_length(text: str) -> int:

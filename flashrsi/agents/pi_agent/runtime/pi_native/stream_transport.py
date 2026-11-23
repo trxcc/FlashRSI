@@ -10,6 +10,8 @@ import re
 
 import httpx
 
+from flashrsi.core.infra import InfraError, infra_reason
+
 from .provider_retry import ProviderRequestError, _delay, _retryable
 from .stream_json import parse_json_with_repair
 
@@ -27,6 +29,7 @@ async def request_stream(
     timeout=None,
     max_retry_delay=60.0,
     no_retry_statuses=(),
+    require_done=False,
 ):
     """Return a JSON body or a canonical Pi message from a live SSE body.
 
@@ -101,6 +104,10 @@ async def request_stream(
                             "content_block_delta",
                             "content_block_stop",
                         }
+                        if anthropic and not event_type:
+                            unnamed = parse_json_with_repair(raw)
+                            if isinstance(unnamed, dict) and "error" in unnamed:
+                                raise InfraError("incomplete_stream")
                         if raw != "[DONE]" and allowed:
                             try:
                                 event = (
@@ -150,6 +157,8 @@ async def request_stream(
                             event_type = value
                     # Comments, id, and retry fields do not alter JSON events.
                 await dispatch()
+                if require_done and not done_sentinel:
+                    raise InfraError("incomplete_stream")
                 canonical = parser.finish()
                 await emit(parser.drain())
                 return {"_pi_message": canonical, "_pi_streamed": True}
@@ -165,7 +174,9 @@ async def request_stream(
             return {"_pi_message": parser.finish(), "_pi_streamed": True}
         except Exception as exc:
             if opened:
-                await emit(parser.fail(str(exc)))
+                reason = infra_reason(exc)
+                error_message = str(InfraError(reason)) if reason else str(exc)
+                await emit(parser.fail(error_message))
                 return {"_pi_message": parser.finish(), "_pi_streamed": True}
             if isinstance(exc, httpx.RequestError):
                 error = ProviderRequestError(str(exc))

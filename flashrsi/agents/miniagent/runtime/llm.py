@@ -8,10 +8,16 @@ Model names do not imply provider-specific options.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from typing import Any
 
+import httpx
 from openai import AsyncOpenAI
+from openai.types.chat import ChatCompletion
+
+from flashrsi.core.infra import InfraError
+from flashrsi.core.provider import read_anthropic_sse
 
 logger = logging.getLogger(__name__)
 
@@ -107,28 +113,38 @@ def configure(config: dict) -> None:
     """Initialize the native runtime in its independent process."""
     global API_KEY, DEFAULT_MODEL, SIDE_MODEL, BASE_URL, SIDE_BASE_URL
     global MAX_TOKENS, LLM_MAX_RETRIES, REASONING_EFFORT, EXTRA_BODY
+    global REQUEST_TIMEOUT, MODEL_API, THINKING, STREAM
     API_KEY = config.get("api_key") or ""
     DEFAULT_MODEL = config.get("model_name") or ""
     SIDE_MODEL = config.get("side_model") or DEFAULT_MODEL
     BASE_URL = config.get("base_url") or "https://api.openai.com/v1"
     SIDE_BASE_URL = config.get("side_base_url") or BASE_URL
-    MAX_TOKENS = config.get("max_tokens", 4096)
     LLM_MAX_RETRIES = max(1, config.get("llm_max_retries", 1))
     REASONING_EFFORT = config.get("reasoning_effort") or ""
     EXTRA_BODY = config.get("extra_body") or {}
+    REQUEST_TIMEOUT = float(config.get("request_timeout", 900))
+    MODEL_API = config.get("model_api")
+    THINKING = config.get("thinking")
+    MAX_TOKENS = config.get("max_tokens")
+    if MAX_TOKENS is None:
+        MAX_TOKENS = 65536 if DEFAULT_MODEL == "deepseek-flash" else 4096
+    STREAM = config.get("stream", True)
 
 
 configure({})
 
-_clients: dict[tuple[str, str], AsyncOpenAI] = {}
+_clients: dict[tuple[str, str, float], AsyncOpenAI] = {}
 
 
 def _get_client(base_url: str) -> AsyncOpenAI:
     if not API_KEY:
         raise RuntimeError("MiniAgent requires llm.api_key in config")
-    key = (base_url, API_KEY)
+    key = (base_url, API_KEY, REQUEST_TIMEOUT)
     if key not in _clients:
-        _clients[key] = AsyncOpenAI(api_key=API_KEY, base_url=base_url, max_retries=0)
+        _clients[key] = AsyncOpenAI(
+            api_key=API_KEY, base_url=base_url, timeout=httpx.Timeout(REQUEST_TIMEOUT, connect=20),
+            max_retries=0
+        )
     return _clients[key]
 
 
@@ -216,6 +232,102 @@ def extract_responses_output(resp) -> tuple[str, str, list]:
 # ---------------------------------------------------------------------------
 
 
+
+def _anthropic_history(messages):
+    system = []
+    history = []
+    for item in messages:
+        role = item["role"]
+        text = item.get("content") or ""
+        if role == "system":
+            system.append(text)
+        elif role == "assistant" and "anthropic_content" in item:
+            history.append({"role": "assistant", "content": item["anthropic_content"]})
+        elif role == "tool":
+            block = {
+                "type": "tool_result", "tool_use_id": item["tool_call_id"], "content": text,
+            }
+            if history and history[-1]["role"] == "user" and isinstance(history[-1]["content"], list):
+                history[-1]["content"].append(block)
+            else:
+                history.append({"role": "user", "content": [block]})
+        else:
+            history.append({"role": role, "content": text})
+    return "\n\n".join(system), history
+
+
+async def _anthropic_chat(base_url, model, messages, tools, tool_choice, max_tokens):
+    if not API_KEY:
+        raise ValueError("MiniAgent requires llm.api_key in config")
+    endpoint = base_url.rstrip("/")
+    if not endpoint.endswith("/messages"):
+        endpoint += "/messages" if endpoint.endswith("/v1") else "/v1/messages"
+    system, history = _anthropic_history(messages)
+    payload = {"model": model, "messages": history, "max_tokens": max_tokens}
+    if system:
+        payload["system"] = system
+    if tools:
+        payload["tools"] = [
+            {
+                "name": item["function"]["name"],
+                "description": item["function"].get("description", ""),
+                "input_schema": item["function"].get("parameters") or {"type": "object"},
+            }
+            for item in tools
+        ]
+        if isinstance(tool_choice, dict):
+            payload["tool_choice"] = {"type": "tool", "name": tool_choice["function"]["name"]}
+        else:
+            payload["tool_choice"] = {"type": "any" if tool_choice == "required" else tool_choice}
+    if isinstance(THINKING, dict):
+        payload["thinking"] = THINKING
+    if REASONING_EFFORT:
+        payload["output_config"] = {"effort": REASONING_EFFORT}
+    payload.update(EXTRA_BODY)
+    headers = {"x-api-key": API_KEY, "anthropic-version": "2023-06-01"}
+    async with httpx.AsyncClient(timeout=httpx.Timeout(REQUEST_TIMEOUT, connect=20)) as client:
+        if STREAM:
+            payload["stream"] = True
+            async with client.stream("POST", endpoint, headers=headers, json=payload) as response:
+                response.raise_for_status()
+                native = await read_anthropic_sse(response)
+        else:
+            response = await client.post(endpoint, headers=headers, json=payload)
+            response.raise_for_status()
+            try:
+                native = response.json()
+            except json.JSONDecodeError:
+                raise InfraError("incomplete_response") from None
+    blocks = native.get("content") or []
+    message = {
+        "role": "assistant",
+        "content": "".join(b.get("text", "") for b in blocks if b.get("type") == "text"),
+        "anthropic_content": blocks,
+        "tool_calls": [
+            {
+                "type": "function", "id": b["id"],
+                "function": {"name": b["name"], "arguments": json.dumps(b.get("input") or {})},
+            }
+            for b in blocks if b.get("type") == "tool_use"
+        ],
+    }
+    stop = {"end_turn": "stop", "stop_sequence": "stop", "tool_use": "tool_calls",
+            "max_tokens": "length", "refusal": "content_filter"}.get(native.get("stop_reason"))
+    if stop is None:
+        raise InfraError("incomplete_response")
+    usage = native.get("usage") or {}
+    incoming = sum(usage.get(k, 0) or 0 for k in (
+        "input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens",
+    ))
+    outgoing = usage.get("output_tokens", 0) or 0
+    return ChatCompletion.model_validate({
+        "id": native.get("id", ""), "created": 0, "object": "chat.completion", "model": model,
+        "choices": [{"index": 0, "message": message, "finish_reason": stop}],
+        "usage": {**usage, "prompt_tokens": incoming, "completion_tokens": outgoing,
+                  "total_tokens": incoming + outgoing},
+    })
+
+
 async def chat(
     messages: list[dict],
     *,
@@ -226,6 +338,9 @@ async def chat(
 ) -> Any:
     """One-shot chat completion. Returns an OpenAI ChatCompletion response."""
     target = model or DEFAULT_MODEL
+    base_url = SIDE_BASE_URL if target == SIDE_MODEL else BASE_URL
+    if MODEL_API in {"anthropic", "anthropic-messages", "anthropic_messages"} or base_url.rstrip("/").endswith(("/anthropic", "/anthropic/v1")):
+        return await _anthropic_chat(base_url, target, messages, tools, tool_choice, max_tokens or MAX_TOKENS)
     token_field = "max_completion_tokens" if is_openai_model(target) else "max_tokens"
     kwargs: dict = {
         "model": target.removeprefix("openai/"),
@@ -238,10 +353,14 @@ async def chat(
         kwargs["tool_choice"] = "none"
     if REASONING_EFFORT:
         kwargs["reasoning_effort"] = REASONING_EFFORT
-    if EXTRA_BODY:
-        kwargs["extra_body"] = EXTRA_BODY
-    base_url = SIDE_BASE_URL if target == SIDE_MODEL else BASE_URL
-    return await _get_client(base_url).chat.completions.create(**kwargs)
+    extra = {"thinking": THINKING} if isinstance(THINKING, dict) else {}
+    extra.update(EXTRA_BODY)
+    if extra:
+        kwargs["extra_body"] = extra
+    try:
+        return await _get_client(base_url).chat.completions.create(**kwargs)
+    except json.JSONDecodeError:
+        raise InfraError("incomplete_response") from None
 
 
 async def responses(

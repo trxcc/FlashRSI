@@ -13,9 +13,13 @@ import copy
 import inspect
 import json
 from collections.abc import AsyncIterator, Mapping
+from dataclasses import replace
 from typing import Any
 
 import httpx
+
+from flashrsi.core.infra import InfraError
+from flashrsi.core.provider import is_deepseek, read_anthropic_sse
 
 from .models import ModelResult, content_text
 
@@ -76,8 +80,14 @@ def _request_options(
         elif "max_tokens" in llm:
             options["max_tokens"] = llm["max_tokens"]
     effort = llm.get("reasoning_effort", llm.get("effort"))
-    if effort is not None and not anthropic:
-        options["reasoning_effort"] = effort
+    if effort is not None:
+        if anthropic:
+            if is_deepseek(llm.get("model_name", llm.get("model"))):
+                options["output_config"] = {"effort": effort}
+        else:
+            options["reasoning_effort"] = effort
+    if isinstance(llm.get("thinking"), Mapping) and not responses:
+        options["thinking"] = dict(llm["thinking"])
     extra = llm.get("extra_body", config.get("extra_body"))
     if isinstance(extra, Mapping):
         options.update(dict(extra))
@@ -210,13 +220,18 @@ def _parse_chat(data: Mapping[str, Any]) -> ModelResult:
     choice = (data.get("choices") or [{}])[0]
     msg = choice.get("message") or {}
     calls = tuple(_normal_call(call) for call in (msg.get("tool_calls") or []))
-    return ModelResult(
+    result = ModelResult(
         content_text(msg.get("content", "")),
         calls,
         choice.get("finish_reason"),
         dict(data.get("usage") or {}),
         dict(data),
     )
+
+    reasoning = msg.get("reasoning_content")
+    if reasoning is None:
+        return result
+    return replace(result, history={"reasoning_content": reasoning})
 
 
 def _parse_anthropic(data: Mapping[str, Any]) -> ModelResult:
@@ -235,9 +250,10 @@ def _parse_anthropic(data: Mapping[str, Any]) -> ModelResult:
         for part in parts
         if isinstance(part, Mapping) and part.get("type") == "tool_use"
     )
-    return ModelResult(
+    result = ModelResult(
         text, calls, data.get("stop_reason"), dict(data.get("usage") or {}), dict(data)
     )
+    return replace(result, history={"anthropic_content": copy.deepcopy(parts)})
 
 
 def _chat_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -311,6 +327,8 @@ def _chat_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
             }
         else:
             item = {"role": role, "content": content}
+        if role == "assistant" and "reasoning_content" in original:
+            item["reasoning_content"] = original["reasoning_content"]
         out.append(item)
         if role == "tool":
             pending_media.extend(_attachments(original))
@@ -333,7 +351,9 @@ def _anthropic_messages(
             system_parts.append(content_text(content))
             continue
         calls = item.get("tool_calls") or []
-        if role == "assistant" and calls:
+        if role == "assistant" and "anthropic_content" in item:
+            out.append({"role": "assistant", "content": copy.deepcopy(item["anthropic_content"])})
+        elif role == "assistant" and calls:
             blocks: list[dict[str, Any]] = []
             if content_text(content):
                 blocks.append({"type": "text", "text": content_text(content)})
@@ -512,20 +532,29 @@ def _sse_json(line: str) -> Mapping[str, Any] | None:
     return value if isinstance(value, Mapping) else None
 
 
-async def _stream_chat(response: httpx.Response, event_cb) -> ModelResult:
+async def _stream_chat(response: httpx.Response, event_cb, *, require_done=False) -> ModelResult:
     text: list[str] = []
+    reasoning: list[str] = []
+    done = False
     call_state: dict[int, dict[str, Any]] = {}
     usage: dict[str, Any] = {}
     finish = None
     raw_events: list[dict[str, Any]] = []
     async for line in response.aiter_lines():
+        if line.startswith("data:") and line[5:].strip() == "[DONE]":
+            done = True
+            break
         data = _sse_json(line)
         if data is None:
             continue
+        if "error" in data:
+            raise InfraError("incomplete_stream")
         raw_events.append(dict(data))
         await _notify(event_cb, data)
         choice = (data.get("choices") or [{}])[0]
         delta = choice.get("delta") or {}
+        if delta.get("reasoning_content") is not None:
+            reasoning.append(delta["reasoning_content"])
         if delta.get("content"):
             text.append(str(delta["content"]))
         finish = choice.get("finish_reason") or finish
@@ -540,56 +569,27 @@ async def _stream_chat(response: httpx.Response, event_cb) -> ModelResult:
             fn = part.get("function") or {}
             state["name"] += str(fn.get("name") or "")
             state["arguments"] += str(fn.get("arguments") or "")
-    return ModelResult(
+    if (require_done and (not done or not finish)) or not raw_events:
+        raise InfraError("incomplete_stream")
+    result = ModelResult(
         "".join(text),
         tuple(_normal_call(state) for state in call_state.values()),
         finish,
         usage,
         {"events": raw_events},
     )
+    if reasoning:
+        result = replace(result, history={"reasoning_content": "".join(reasoning)})
+    return result
 
 
-async def _stream_anthropic(response: httpx.Response, event_cb) -> ModelResult:
-    text: list[str] = []
-    calls: list[dict[str, Any]] = []
-    current: dict[str, Any] | None = None
-    usage: dict[str, Any] = {}
-    stop = None
-    raw_events: list[dict[str, Any]] = []
-    async for line in response.aiter_lines():
-        data = _sse_json(line)
-        if data is None:
-            continue
-        raw_events.append(dict(data))
-        await _notify(event_cb, data)
-        typ = data.get("type")
-        if typ == "content_block_start":
-            block = data.get("content_block") or {}
-            if block.get("type") == "tool_use":
-                current = {
-                    "id": block.get("id", "call"),
-                    "name": block.get("name", ""),
-                    "arguments": "",
-                }
-                calls.append(current)
-        elif typ == "content_block_delta":
-            delta = data.get("delta") or {}
-            if delta.get("type") == "text_delta":
-                text.append(str(delta.get("text") or ""))
-            elif delta.get("type") == "input_json_delta" and current is not None:
-                current["arguments"] += str(delta.get("partial_json") or "")
-        elif typ == "message_delta":
-            stop = (data.get("delta") or {}).get("stop_reason") or stop
-            usage.update(data.get("usage") or {})
-        elif typ == "message_start":
-            usage.update((data.get("message") or {}).get("usage") or {})
-    return ModelResult(
-        "".join(text),
-        tuple(_normal_call(call) for call in calls),
-        stop,
-        usage,
-        {"events": raw_events},
-    )
+async def _stream_anthropic(response: httpx.Response, event_cb, *, require_stop=False) -> ModelResult:
+    async def notify(event):
+        await _notify(event_cb, event)
+
+    data = await read_anthropic_sse(response, notify, require_stop=require_stop)
+    result = _parse_anthropic(data)
+    return replace(result, raw={"events": data["events"]})
 
 
 async def _stream_responses(response: httpx.Response, event_cb) -> ModelResult:
@@ -754,7 +754,7 @@ async def complete(
     stream = bool(llm.get("stream", config.get("stream", True)))
     own = client is None
     client = client or httpx.AsyncClient(
-        timeout=float(config.get("request_timeout", 120))
+        timeout=float(config.get("request_timeout", 660))
     )
     try:
         if api in {"anthropic_messages", "anthropic"}:
@@ -796,7 +796,7 @@ async def complete(
                     json=payload,
                 ) as response:
                     response.raise_for_status()
-                    return await _stream_anthropic(response, event_cb)
+                    return await _stream_anthropic(response, event_cb, require_stop=is_deepseek(model))
             response = await client.post(
                 _url(_base(config, "https://api.anthropic.com"), "v1/messages"),
                 headers=_headers(config, anthropic=True),
@@ -860,7 +860,7 @@ async def complete(
                 json=payload,
             ) as response:
                 response.raise_for_status()
-                return await _stream_chat(response, event_cb)
+                return await _stream_chat(response, event_cb, require_done=is_deepseek(model))
         response = await client.post(
             _url(_base(config, "https://api.openai.com/v1"), "chat/completions"),
             headers=_headers(config),
@@ -868,6 +868,8 @@ async def complete(
         )
         response.raise_for_status()
         return _parse_chat(response.json())
+    except json.JSONDecodeError:
+        raise InfraError("incomplete_response") from None
     finally:
         if own:
             await client.aclose()

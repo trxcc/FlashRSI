@@ -1,4 +1,8 @@
-"""Fixed framework adapter; the selected Snapshot supplies the Python Codex core."""
+"""Run the Python Codex core from the selected harness snapshot.
+
+The adapter owns per-run CLI settings and credential transport. Resources
+and extensions come from the snapshot staged for the isolated process.
+"""
 
 from __future__ import annotations
 
@@ -9,16 +13,18 @@ import os
 import signal
 import sys
 import tomllib
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import Any
 from urllib.parse import quote_from_bytes, urlsplit
 
 from flashrsi.core import Agent, Snapshot, Task, Trajectory
 from flashrsi.core.agent import _Execution
+from flashrsi.core.provider import is_deepseek
 
 
-def _runtime_home():
+def _runtime_home() -> TemporaryDirectory:
     """Keep per-run executable resources outside the system temporary tree."""
     configured = os.environ.get("XDG_CACHE_HOME")
     cache = (
@@ -83,7 +89,37 @@ class Codex(Agent):
         return await run(self, prompt, working_dir)
 
 
-def _settings(config, resource_home, task_dir, *, source_root=None):
+def _deepseek_responses(config: Mapping[str, Any]) -> bool:
+    llm = config["llm"]
+    return is_deepseek(llm["model_name"]) and (
+        bool(config.get("_suite_model_relay"))
+        or urlsplit(llm.get("base_url") or "").hostname == "api.deepseek.com"
+    )
+
+
+def _settings(
+    config: Mapping[str, Any],
+    resource_home: Path,
+    task_dir: Path,
+    *,
+    source_root: Path | str | None = None,
+) -> tuple[dict[str, Any], dict[str, str], dict[str, Any]]:
+    _validate_role(config)
+    provider_name, base_url = _provider(config)
+    native = _native_settings(resource_home)
+    env = _runtime_env(resource_home, task_dir)
+    overrides = _task_overrides(native, resource_home, task_dir)
+    resources = (
+        Path(source_root or config.get("source_dir", Path(__file__).parent))
+        .expanduser()
+        .resolve()
+    )
+    overrides.update(_resource_overrides(native, resources, resource_home))
+    _configure_provider(config, provider_name, base_url, overrides, env)
+    return overrides, env, native
+
+
+def _validate_role(config: Mapping[str, Any]) -> None:
     llm = config["llm"]
     unsupported = set(llm) - {
         "model_name",
@@ -92,23 +128,46 @@ def _settings(config, resource_home, task_dir, *, source_root=None):
         "auth",
         "reasoning_effort",
         "provider_name",
+        "thinking",
+        "effort",
+        "max_tokens",
+        "max_output_tokens",
+        "request_timeout",
+        "extra_body",
+        "extra_headers",
+        # Options used by the Claude Code transport in shared role configs.
+        "api_timeout_ms",
+        "stream_idle_timeout_ms",
+        "max_retries",
     }
     if unsupported:
         raise ValueError(
             "Unsupported Codex llm fields: " + ", ".join(sorted(unsupported))
         )
-    if "max_turns" in config:
-        raise ValueError("Codex exec has no max_turns limit; use timeout")
+    max_turns = config.get("max_turns")
+    if max_turns is not None and (type(max_turns) is not int or max_turns < 1):
+        raise ValueError("Codex max_turns must be a positive integer or None")
     if "auth_dir" in config:
         raise ValueError(
             "Codex credentials come from llm.api_key; auth_dir is unsupported"
         )
+
+
+def _provider(config: Mapping[str, Any]) -> tuple[str, str]:
+    llm = config["llm"]
     provider_name = llm.get("provider_name")
     if "provider_name" in llm and (
         not isinstance(provider_name, str) or not provider_name.strip()
     ):
         raise ValueError("Codex llm.provider_name must be a nonempty string")
     base_url = llm.get("base_url") or "https://api.openai.com/v1"
+    if _deepseek_responses(config):
+        if urlsplit(base_url).hostname == "api.deepseek.com":
+            base_url = "https://api.deepseek.com"
+        else:
+            base_url = (
+                base_url.rstrip("/").removesuffix("/v1").removesuffix("/anthropic")
+            )
     if provider_name is None:
         hostname = urlsplit(base_url).hostname or ""
         if hostname == "api.openai.com":
@@ -117,6 +176,10 @@ def _settings(config, resource_home, task_dir, *, source_root=None):
             provider_name = "Azure"
         else:
             provider_name = "FlashRSI endpoint"
+    return provider_name, base_url
+
+
+def _native_settings(resource_home: Path) -> dict[str, Any]:
     native_path = resource_home / "config.toml"
     native = (
         tomllib.loads(native_path.read_text(encoding="utf-8"))
@@ -138,6 +201,10 @@ def _settings(config, resource_home, task_dir, *, source_root=None):
         raise ValueError(
             "config.toml cannot set runtime fields: " + ", ".join(sorted(conflicts))
         )
+    return native
+
+
+def _runtime_env(resource_home: Path, task_dir: Path) -> dict[str, str]:
     # Inherited Codex app/daemon/provider settings must not redirect this role.
     env = {
         key: value
@@ -147,6 +214,15 @@ def _settings(config, resource_home, task_dir, *, source_root=None):
     }
     env["CODEX_HOME"] = str(resource_home)
     env["CODEX_SQLITE_HOME"] = str(resource_home.parent / "state")
+    env["FLASHRSI_TASK_DIR"] = str(task_dir)
+    return env
+
+
+def _task_overrides(
+    native: Mapping[str, Any],
+    resource_home: Path,
+    task_dir: Path,
+) -> dict[str, Any]:
     task_path = task_dir.resolve()
     task_roots = (task_path, *task_path.parents)
     projects = dict(native.get("projects", {}))
@@ -158,22 +234,22 @@ def _settings(config, resource_home, task_dir, *, source_root=None):
             **projects.get(str(path), {}),
             "trust_level": "untrusted",
         }
-    overrides = {
+    return {
         "approval_policy": "never",
         "cli_auth_credentials_store": "file",
         "log_dir": str(resource_home.parent / "logs"),
         "history.persistence": "none",
         "projects": projects,
     }
-    # Codex 0.147 has no stdio MCP cwd field. Only explicit paths name resources:
-    # a bare identifier may instead be a Python module or an option's value.
-    # Overrides apply only to this run; Snapshot config stays portable.
-    env["FLASHRSI_TASK_DIR"] = str(task_dir)
-    source_root = (
-        Path(source_root or config.get("source_dir", Path(__file__).parent))
-        .expanduser()
-        .resolve()
-    )
+
+
+def _resource_overrides(
+    native: Mapping[str, Any],
+    source_root: Path,
+    resource_home: Path,
+) -> dict[str, Any]:
+    # Only explicit paths name resources. Bare names may be modules or flags.
+    overrides = {}
     mapped_servers = {}
     for name, server in native.get("mcp_servers", {}).items():
         mapped = dict(server)
@@ -210,33 +286,45 @@ def _settings(config, resource_home, task_dir, *, source_root=None):
     ]
     if configured or disabled:
         overrides["skills.config"] = [*configured, *disabled]
-    if llm.get("reasoning_effort") is not None:
-        overrides["model_reasoning_effort"] = llm["reasoning_effort"]
-    auth = llm.get("auth", "api_key")
-    if auth == "api_key":
-        key = llm.get("api_key")
-        if not isinstance(key, str) or not key.strip():
-            raise ValueError("Codex requires the framework role's llm.api_key")
-        env["FLASHRSI_CODEX_API_KEY"] = key
-        overrides.update(
-            {
-                "model_provider": "flashrsi",
-                "model_providers.flashrsi.name": provider_name,
-                "model_providers.flashrsi.base_url": base_url,
-                "model_providers.flashrsi.env_key": "FLASHRSI_CODEX_API_KEY",
-                "model_providers.flashrsi.wire_api": "responses",
-                "model_providers.flashrsi.requires_openai_auth": False,
-                "model_providers.flashrsi.supports_websockets": False,
-            }
-        )
-    else:
+    return overrides
+
+
+def _configure_provider(
+    config: Mapping[str, Any],
+    provider_name: str,
+    base_url: str,
+    overrides: dict[str, Any],
+    env: dict[str, str],
+) -> None:
+    llm = config["llm"]
+    effort = llm.get("reasoning_effort") or llm.get("effort")
+    if _deepseek_responses(config) and effort in {"off", "none", "ultra"}:
+        effort = {"off": "none", "none": "none", "ultra": "max"}[effort]
+    if effort is not None:
+        overrides["model_reasoning_effort"] = effort
+    if llm.get("auth", "api_key") != "api_key":
         raise ValueError(
             "Codex uses framework llm.api_key; native login is not supported"
         )
-    return overrides, env, native
+
+    key = llm.get("api_key")
+    if not isinstance(key, str) or not key.strip():
+        raise ValueError("Codex requires the framework role's llm.api_key")
+    env["FLASHRSI_CODEX_API_KEY"] = key
+    overrides.update(
+        {
+            "model_provider": "flashrsi",
+            "model_providers.flashrsi.name": provider_name,
+            "model_providers.flashrsi.base_url": base_url,
+            "model_providers.flashrsi.env_key": "FLASHRSI_CODEX_API_KEY",
+            "model_providers.flashrsi.wire_api": "responses",
+            "model_providers.flashrsi.requires_openai_auth": False,
+            "model_providers.flashrsi.supports_websockets": False,
+        }
+    )
 
 
-def _resource_path(value, source_root, resource_home):
+def _resource_path(value: str, source_root: Path, resource_home: Path) -> str:
     """Relocate explicit references to files in the selected resource version."""
     path = Path(value)
     if path.is_absolute():
@@ -254,7 +342,7 @@ def _resource_path(value, source_root, resource_home):
     return value
 
 
-def _ambient_skills(roots):
+def _ambient_skills(roots: Iterable[Path]) -> list[Path]:
     """Match native skill discovery, including symlinked skill installations."""
     files = set()
     for root in sorted(roots):
@@ -305,7 +393,7 @@ def _ambient_skills(roots):
     return sorted(files)
 
 
-def _toml(value):
+def _toml(value: Any) -> str:
     """Encode the small native CLI override values, including inline tables."""
     if isinstance(value, dict):
         return "{" + ",".join(f"{_toml(k)}={_toml(v)}" for k, v in value.items()) + "}"
@@ -314,7 +402,7 @@ def _toml(value):
     return json.dumps(value, ensure_ascii=False)
 
 
-async def _wait_for_group_exit(pid, timeout):
+async def _wait_for_group_exit(pid: int, timeout: float) -> bool:
     deadline = asyncio.get_running_loop().time() + timeout
     while asyncio.get_running_loop().time() < deadline:
         try:
@@ -329,7 +417,9 @@ async def _wait_for_group_exit(pid, timeout):
     return False
 
 
-async def _stop(process, *, interrupt_timeout=2):
+async def _stop(
+    process: asyncio.subprocess.Process, *, interrupt_timeout: float = 2
+) -> None:
     """Reap the native process and its children before removing resource files."""
     if os.name == "posix" and process.returncode is not None:
         # Native notify hooks intentionally outlive the main process. Give them

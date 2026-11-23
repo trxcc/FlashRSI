@@ -11,7 +11,13 @@ import json
 import re
 from typing import Any, Mapping
 
-from .compaction import content_text, js_json, model_limits, model_metadata
+from .compaction import (
+    content_text,
+    js_json,
+    model_limits,
+    model_metadata,
+    requested_max_tokens,
+)
 from .openai_options import (
     apply_compat_cache_control,
     apply_service_tier_pricing,
@@ -1152,14 +1158,9 @@ def build_payload(config, context, api, reasoning=None, fallback_tools=()):
     level = clamp_reasoning(model, reasoning)
     mapping = model.get("thinkingLevelMap") or {}
     mapped = mapping.get(level, level) if level else mapping.get("off")
-    context_window, model_max = model_limits(config)
-    requested = config.get("max_tokens", llm.get("max_tokens", model_max))
-    if requested is None:
-        requested = model_max
+    context_window, _ = model_limits(config)
     cap = clamp_max_tokens(
-        context_window,
-        context,
-        int(requested),
+        context_window, context, requested_max_tokens(config),
     )
     tools, _ = resolve_tools(context, tool_support(compat, api))
     if not any(
