@@ -1,0 +1,35 @@
+# Sealed inventory. Runner refuses access before loading the manifest.
+run:
+  output_dir: ../../runs/suite/clawgym_bench_sealed
+benchmark:
+  name: clawgym_bench_sealed
+  allow_sealed_test: false
+  claw_solver_timeout: 660
+  long_episode_timeout: 3000
+  claw_checker_timeout: 120
+  claw_judge_timeout: 180
+agent:
+  name: claude_code
+  timeout: 660
+  request_timeout: 900
+  max_turns: null
+  llm:
+    model_name: deepseek-flash
+    provider_name: deepseek
+    base_url: https://api.deepseek.com/v1
+    reasoning_effort: high
+    thinking:
+      type: enabled
+algorithm:
+  name: ace
+  worker:
+    type: llm
+    llm:
+      model_name: deepseek-flash
+      base_url: https://api.deepseek.com/v1
+      reasoning_effort: high
+      extra_body:
+        thinking:
+          type: enabled
+  mode: online
+  max_reflection_rounds: 1

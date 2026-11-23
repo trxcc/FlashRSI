@@ -1,0 +1,65 @@
+# Use --smoke to select reviewed open tasks and bounded budgets.
+run:
+  output_dir: ../../runs/suite/workspace_dualgate_codex
+benchmark:
+  name: workspace_dualgate
+  allow_sealed_test: false
+  claw_solver_timeout: 660
+  long_episode_timeout: 3000
+  claw_judge_timeout: 180
+  claw_max_turns: null
+  harvey_max_turns: 200
+  harvey_solver_timeout: 3600
+  claw_checker_timeout: 120
+  extractor_timeout: 120
+  judge_timeout: 720
+  judge_phase_timeout: 3600
+  cpus: 2
+  memory: 4g
+  solver_pids: 192
+  pids: 256
+  shm_size: 256m
+  train_judge_mode: batched
+  val_judge_mode: per_criterion
+  batch_size: 24
+  judge_max_tokens: 16384
+  judge_concurrency: 8
+  judge_thinking: {type: enabled}
+  judge_reasoning_effort: high
+  val_judge:
+    judge_model: gemini-3.5-flash
+    judge_base_url: https://generativelanguage.googleapis.com/v1beta/openai
+    judge_api_key_env: GEMINI_API_KEY
+    judge_thinking: null
+    judge_reasoning_effort: null
+    judge_temperature: 0
+agent:
+  name: codex
+  timeout: 3600
+  request_timeout: 900
+  max_turns: 200
+  llm:
+    model_name: deepseek-flash
+    provider_name: deepseek
+    base_url: https://api.deepseek.com/v1
+    reasoning_effort: high
+    thinking: {type: enabled}
+algorithm:
+  name: two_gate_workspace
+  worker:
+    type: llm
+    request_timeout: 900
+    llm:
+      model_name: deepseek-flash
+      base_url: https://api.deepseek.com/v1
+      reasoning_effort: high
+      extra_body:
+        thinking: {type: enabled}
+  rounds: 1
+  val_repeats: 2
+  min_harvey_gain: 0.004
+  max_growth_ratio: 0.10
+  strict_claw_gain: false
+  max_evidence_chars: 16000
+  claw_evidence_chars: 8000
+  harvey_evidence_chars: 8000

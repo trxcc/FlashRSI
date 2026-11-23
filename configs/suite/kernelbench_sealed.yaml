@@ -1,0 +1,31 @@
+# Sealed inventory. Runner refuses access before loading the manifest.
+run:
+  output_dir: ../../runs/suite/kernelbench_sealed
+benchmark:
+  name: kernelbench_sealed
+  allow_sealed_test: false
+  oracle_budget: 10
+agent:
+  name: program_search
+  timeout: 12640
+  request_timeout: 900
+  llm:
+    model_name: deepseek-flash
+    provider_name: deepseek
+    base_url: https://api.deepseek.com/v1
+    reasoning_effort: high
+    thinking:
+      type: enabled
+algorithm:
+  name: ace
+  worker:
+    type: llm
+    llm:
+      model_name: deepseek-flash
+      base_url: https://api.deepseek.com/v1
+      reasoning_effort: high
+      extra_body:
+        thinking:
+          type: enabled
+  mode: online
+  max_reflection_rounds: 1

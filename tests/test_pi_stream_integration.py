@@ -436,7 +436,7 @@ def test_native_stream_connection_break_after_partial_response_is_never_retried(
     assert len(messages) == 1
     assert messages[0]["content"] == expected(case)["content"]
     assert messages[0]["usage"] == expected(case)["usage"]
-    assert messages[0]["errorMessage"] == "offline stream broke"
+    assert messages[0]["errorMessage"] == "InfraError: connection"
     assert saved_assistants(session) == messages
     assert result.usage["model_calls"] == 1
 

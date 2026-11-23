@@ -307,7 +307,10 @@ def test_pi_bash_timeout_preserves_partial_output(tmp_path):
         "bash", {"command": "printf before; exec sleep 1", "timeout": 0.05}, tmp_path
     )
     assert result.is_error
-    assert result.content == "before\n\nCommand timed out after 0.05 seconds"
+    assert result.content == (
+        "before\n\nCommand timed out after 0.05 seconds"
+    )
+    assert result.structured_content is None
 
 
 @pytest.mark.parametrize("login_shell", ["/bin/zsh", None])

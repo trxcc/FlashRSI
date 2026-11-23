@@ -84,7 +84,8 @@ def test_executed_tool_outputs_match_original_source(case, tmp_path):
         actual = json.loads(json.dumps(actual).replace(spill, "<OUTPUT>"))
         Path(spill).unlink()
     actual = json.loads(json.dumps(actual).replace(str(tmp_path), "<WORKDIR>"))
-    assert actual == case["result"]
+    expected = copy.deepcopy(case["result"])
+    assert actual == expected
 
 
 def test_bash_cancel_and_timeout_kill_descendants(tmp_path):

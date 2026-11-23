@@ -1,0 +1,34 @@
+# Sealed inventory. Runner refuses access before loading the manifest.
+run:
+  output_dir: ../../runs/suite/swebench_verified_sealed
+benchmark:
+  name: swebench_verified_sealed
+  allow_sealed_test: false
+  evaluation_timeout: 1800
+agent:
+  name: claude_code
+  timeout: 3600
+  request_timeout: 900
+  max_turns: null
+  swe_bench:
+    timeout: 3600
+  llm:
+    model_name: deepseek-flash
+    provider_name: deepseek
+    base_url: https://api.deepseek.com/v1
+    reasoning_effort: high
+    thinking:
+      type: enabled
+algorithm:
+  name: ace
+  worker:
+    type: llm
+    llm:
+      model_name: deepseek-flash
+      base_url: https://api.deepseek.com/v1
+      reasoning_effort: high
+      extra_body:
+        thinking:
+          type: enabled
+  mode: online
+  max_reflection_rounds: 1

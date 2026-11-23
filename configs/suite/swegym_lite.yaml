@@ -1,0 +1,55 @@
+# Use --smoke to select reviewed open tasks and bounded budgets.
+run:
+  output_dir: ../../runs/suite/swegym_lite
+benchmark:
+  name: swegym_lite
+  allow_sealed_test: false
+  smoke_whitelist_only: false
+  smoke_task_ids: [getmoto__moto-5699]
+  setup_timeout: 600
+  evaluation_timeout: 1800
+  summary_timeout: 60
+  cleanup_grace: 60
+  verifier_resources:
+    cpus: 2
+    memory: 4g
+    pids_limit: 512
+    shm_size: 64m
+    storage: 20g
+agent:
+  name: claude_code
+  timeout: 3600
+  request_timeout: 900
+  max_turns: null
+  swe_bench:
+    timeout: 3600
+    setup_timeout: 600
+    cleanup_grace: 60
+    resources:
+      cpus: 2
+      memory: 4g
+      pids_limit: 512
+      shm_size: 64m
+      storage: 20g
+  llm:
+    model_name: deepseek-flash
+    provider_name: deepseek
+    base_url: https://api.deepseek.com/v1
+    reasoning_effort: high
+    thinking: {type: enabled}
+algorithm:
+  name: ace
+  worker:
+    type: llm
+    request_timeout: 900
+    llm:
+      model_name: deepseek-flash
+      base_url: https://api.deepseek.com/v1
+      reasoning_effort: high
+      extra_body:
+        thinking: {type: enabled}
+  mode: online
+  num_epochs: 1
+  batch_size: 4
+  max_reflection_rounds: 1
+  val_repeats: 0

@@ -1,0 +1,41 @@
+# Use --smoke to select reviewed open tasks and bounded budgets.
+run:
+  output_dir: ../../runs/suite/engdesign_open_codex
+benchmark:
+  name: engdesign_open
+  allow_sealed_test: false
+  smoke_task_ids: [XG_13]
+  grader_timeout: 420
+  solver_resources: {cpus: 4, memory: 8g, pids_limit: 256, shm_size: 1g}
+  solver_timeout: 5400
+  max_turns: 250
+  val_repeats: 4
+  min_val_gain: 0.020
+agent:
+  name: codex
+  timeout: 5400
+  request_timeout: 900
+  max_turns: 250
+  llm:
+    model_name: deepseek-flash
+    provider_name: deepseek
+    base_url: https://api.deepseek.com/v1
+    reasoning_effort: high
+    thinking: {type: enabled}
+algorithm:
+  name: ace
+  worker:
+    type: llm
+    request_timeout: 900
+    llm:
+      model_name: deepseek-flash
+      base_url: https://api.deepseek.com/v1
+      reasoning_effort: high
+      extra_body:
+        thinking: {type: enabled}
+  mode: online
+  num_epochs: 1
+  batch_size: 4
+  max_reflection_rounds: 1
+  val_repeats: 4
+  min_val_gain: 0.020

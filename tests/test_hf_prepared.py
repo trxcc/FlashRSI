@@ -265,7 +265,7 @@ def test_runner_resolves_hf_for_frozen_evaluation_without_changing_snapshot(
     from flashrsi.config import load_config
     from flashrsi.integrations import supplied_context
 
-    async def setup(docker, name, network, payload, config, timeout):
+    async def setup(docker, name, network, payload, config, timeout, *, drop_net_raw):
         request = json.loads((payload / "request.json").read_text())
         assert "SECRET_LABEL" not in request["prompt"]
         assert set(request) == {"agent_class", "config_yaml", "snapshot_path", "prompt"}
@@ -278,8 +278,8 @@ def test_runner_resolves_hf_for_frozen_evaluation_without_changing_snapshot(
     monkeypatch.setattr(supplied_context.shutil, "which", lambda name: name)
     monkeypatch.setattr(supplied_context, "_setup", setup)
     monkeypatch.setattr(
-        supplied_context,
-        "_run",
+        supplied_context._model_egress,
+        "run",
         AsyncMock(return_value=Trajectory(output="SECRET_LABEL")),
     )
     monkeypatch.setattr(supplied_context, "_cleanup", AsyncMock())
@@ -290,7 +290,11 @@ def test_runner_resolves_hf_for_frozen_evaluation_without_changing_snapshot(
             "agent": {
                 "name": "miniagent",
                 "source_dir": str(source),
-                "llm": {"model_name": "fixture", "api_key": "fixture"},
+                "llm": {
+                    "model_name": "fixture",
+                    "api_key": "fixture",
+                    "base_url": "https://fixture.invalid/v1",
+                },
             },
             "benchmark": benchmark_config,
         }
@@ -610,8 +614,8 @@ def test_alfworld_hf_launch_plan_does_not_require_manual_data_path():
 def test_prepared_profiles_cover_registered_benchmarks_except_hle():
     from flashrsi import _hf, runner
 
-    assert set(_hf.BENCHMARKS) == set(runner._BENCHMARKS) - {"hle"}
-    assert len(_hf.PROFILES) == 34
+    assert set(_hf.BENCHMARKS) == set(runner._BENCHMARKS) - {"hle"} - runner._suite.NAMES
+    assert len(_hf.PROFILES) == 35
     assert not _hf.selected(
         {"name": "hle", "dataset": {"source": _hf.REPO, "config": "hle"}}
     )

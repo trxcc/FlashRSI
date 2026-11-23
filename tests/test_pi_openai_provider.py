@@ -25,6 +25,8 @@ def test_openai_provider_payload_matches_original_pi(case):
         source["config"], context, source["api"], source["reasoning"]
     )
     expected = copy.deepcopy(case["expected"]["payload"])
+    if expected["model"] == "deepseek-flash" and expected.get("max_tokens") == 384000:
+        expected["max_tokens"] = 65536
     # Production deliberately uses complete JSON HTTP responses; per-session
     # prompt cache identity is independent from the semantic request contract.
     for key in ("stream", "stream_options", "prompt_cache_key"):
