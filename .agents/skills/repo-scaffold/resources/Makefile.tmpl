@@ -1,0 +1,24 @@
+# Thin build & verification facade. Business logic lives in Python modules under <pkg>/.
+PY ?= .venv/bin/python
+PYTEST_ARGS ?=
+
+.PHONY: install lint test test-heavy check clean
+
+install:
+	uv venv --seed .venv --python 3.12
+	uv pip install --python $(PY) -e ".[dev]"
+
+lint:
+	$(PY) -m ruff check .
+	$(PY) -m ruff format --check .
+
+test:
+	$(PY) -m pytest -q -m "not heavy and not simulator" $(PYTEST_ARGS)
+
+test-heavy:
+	$(PY) -m pytest -q -m "heavy or simulator" --durations=25 $(PYTEST_ARGS)
+
+check: lint test
+
+clean:
+	rm -rf build dist *.egg-info .pytest_cache .ruff_cache

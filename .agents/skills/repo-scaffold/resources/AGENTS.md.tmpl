@@ -1,0 +1,36 @@
+# AGENTS.md — <Project Name>
+
+Instructions for coding agents working in this repository. Read before editing.
+
+## What this is
+
+<One concise paragraph describing the system, its inputs/outputs, and evaluation/execution boundary.>
+
+## Hard invariants — do not violate
+
+1. **Privilege & ground-truth boundary**: Solver/agent code and environments never import or access verifier assets, hidden labels, or reference solutions. Verifiers treat candidate outputs as untrusted input.
+2. **Determinism & single source of truth**: Pin dependency versions, seeds, timeouts, and numeric thresholds in one canonical config/pin file — never hardcode duplicate constants across modules or check in machine-specific absolute paths.
+3. **Generator-owned files are never hand-edited**: Edit the generator, re-run it, and verify stability via `make check`.
+4. **Conciseness & zero dev narrative**: Keep code, comments, and docs concise. Explain *why* non-obvious constraints exist; never leave prompt/ticket history in source files.
+
+## Repo layout
+
+```text
+<pkg>/               Core Python package
+  core/              Stateless pure functions, metrics, and data structures
+  config/            Typed @dataclass configuration schemas
+  <domain>/          One module per algorithm, benchmark, or service component
+configs/             Declarative YAML profiles
+scripts/             Idempotent setup and launch entry scripts
+tests/               Host-side pytest suite (fast CPU checks vs @pytest.mark.heavy)
+third_party/         Unmodified upstream submodules or gitignored vendor assets
+artifacts/           Gitignored generated data and staged payloads
+outputs/             Gitignored run logs and trajectories
+```
+
+## Commands (keep these green)
+
+- `make install` — create `.venv` via `uv` and install pinned dependencies
+- `make lint` — run static analysis (`ruff` / `pyflakes`) and code hygiene checks
+- `make test` — run fast host CPU unit and contract tests
+- `make check` — run lint + pin/generator drift checks + fast host tests
