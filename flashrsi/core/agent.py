@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import inspect
+import os
 import sys
 from collections.abc import Iterable, Mapping
 from contextvars import ContextVar
@@ -18,6 +20,7 @@ from flashrsi._records import _config_record
 from flashrsi._worker_prompt import instructions
 from flashrsi.config import Config, _ConfigLoader, _validate_role_config
 from flashrsi.core.benchmark import Task
+from flashrsi.core.infra import env_integer, retry
 from flashrsi.core.snapshot import (
     Snapshot,
     _copy_rules,
@@ -208,6 +211,9 @@ class Agent:
     ) -> tuple[Trajectory, ...]:
         """Execute tasks using one pinned version and configuration and attach Tasks.
 
+        FLASHRSI_MAX_CONCURRENCY bounds workers per batch. Retryable failures
+        are replayed up to FLASHRSI_INFRA_RETRIES times before aborting grading.
+
         Omit snapshot to use the current version. Supplying a candidate evaluates
         it without selecting it; only update changes the default version.
         The caller binds an integration for environment tasks. It receives this
@@ -224,6 +230,15 @@ class Agent:
                 "tasks with env require an environment-aware rollout; "
                 "bind an execution integration before rollout"
             )
+        if (
+            env_runner is not None
+            and any(task.env is None for task in tasks)
+            and (getattr(self, "_require_native_env", False)
+                 or os.getenv("FLASHRSI_ALLOW_HOST_FALLBACK") != "1")
+        ):
+            raise ValueError("Environment-bound rollout requires task.env")
+        concurrency = env_integer("FLASHRSI_MAX_CONCURRENCY", 1, 1)
+        retries = env_integer("FLASHRSI_INFRA_RETRIES", 3, 0)
         execution = self._execution.get()
         baseline = execution.snapshot if execution is not None else self._snapshot
         selected = baseline if snapshot is None else snapshot
@@ -233,19 +248,40 @@ class Agent:
         token = self._execution.set(
             _Execution(selected, None, copy.deepcopy(self.config))
         )
-        try:
-            trajectories = []
-            for task in tasks:
+        async def run_task(task):
+            async def attempt():
                 if task.env is None:
                     result = await self.run(task.question)
                 else:
                     result = await env_runner(self, task)
-                    if not isinstance(result, Trajectory):
-                        raise TypeError(
-                            "environment execution must return a Trajectory"
-                        )
-                trajectories.append(replace(result, task=task))
-            return tuple(trajectories)
+                if not isinstance(result, Trajectory):
+                    raise TypeError("task execution must return a Trajectory")
+                return result
+
+            return replace(await retry(attempt, retries), task=task)
+
+        try:
+            if concurrency == 1:
+                return tuple([await run_task(task) for task in tasks])
+            pending = iter(enumerate(tasks))
+            results = [None] * len(tasks)
+
+            async def consume():
+                for index, task in pending:
+                    results[index] = await run_task(task)
+
+            workers = [
+                asyncio.create_task(consume())
+                for _ in range(min(concurrency, len(tasks)))
+            ]
+            try:
+                await asyncio.gather(*workers)
+            except BaseException:
+                for worker in workers:
+                    worker.cancel()
+                await asyncio.gather(*workers, return_exceptions=True)
+                raise
+            return tuple(results)
         finally:
             self._execution.reset(token)
 

@@ -17,6 +17,30 @@ from flashrsi.core.benchmark import Task
 from flashrsi.core.snapshot import Snapshot, _matching_components, _validate_path
 from flashrsi.core.trajectory import Results, Trajectory
 
+_PRIVATE_EVIDENCE_KEYS = {
+    "groundtruth", "referenceanswer", "referenceanswers", "referencesolution",
+    "referencesolutions", "goldanswer", "expectedanswer", "answerkey",
+}
+
+
+def _worker_evidence(value):
+    """Remove private answer fields and nested runtime configuration from evidence."""
+    if isinstance(value, Mapping):
+        return {
+            key: _worker_evidence(item)
+            for key, item in value.items()
+            if key.lower().replace("_", "").replace("-", "") not in _PRIVATE_EVIDENCE_KEYS
+            and not (isinstance(item, Mapping) and item.get("type") == "RunConfig")
+            and not (value.get("type") == "HarborVerifier" and key in {"stdout", "stderr"})
+        }
+    if isinstance(value, (list, tuple)):
+        return [
+            _worker_evidence(item)
+            for item in value
+            if not (isinstance(item, Mapping) and item.get("type") == "RunConfig")
+        ]
+    return value
+
 
 class Algorithm:
     """Shared setup, execution and file recording; subclasses own search policy."""
@@ -124,7 +148,7 @@ class Algorithm:
         marked because it lands mid-JSON: a truncated record should read as
         truncated rather than as a complete attempt.
         """
-        text = json.dumps(list(rows), ensure_ascii=False, sort_keys=True)
+        text = json.dumps([_worker_evidence(row) for row in rows], ensure_ascii=False, sort_keys=True)
         limit = self.config.max_evidence_chars
         return text if len(text) <= limit else text[:limit] + "…"
 
@@ -139,24 +163,7 @@ class Algorithm:
         a row exists to be rendered, so they are plain dicts on the way out.
         """
 
-        def clean(value):
-            # Sampling and delegated traces may nest runtime records. Rebuild
-            # containers so removing them never changes the audit trajectory.
-            if isinstance(value, Mapping):
-                return {
-                    key: clean(item)
-                    for key, item in value.items()
-                    if not isinstance(item, Mapping) or item.get("type") != "RunConfig"
-                }
-            if isinstance(value, (list, tuple)):
-                return [
-                    clean(item)
-                    for item in value
-                    if not isinstance(item, Mapping) or item.get("type") != "RunConfig"
-                ]
-            return value
-
-        return clean(_trajectory_record(trajectory))
+        return _worker_evidence(_trajectory_record(trajectory))
 
     def _promote(self, current: Snapshot, best: Snapshot, **details) -> Snapshot:
         """Select one version at the end of the search and record the decision.

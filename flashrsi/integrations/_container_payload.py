@@ -68,6 +68,14 @@ def _stage(directory, agent, config, prompt):
         requirements.extend(overrides)
         (directory / "overrides.txt").write_text("\n".join(overrides) + "\n")
     (directory / "requirements.txt").write_text("\n".join(requirements) + "\n")
+    if directory_config := config.get("container_runtime_kit"):
+        kit = Path(directory_config)
+        available = set((kit / "requirements.txt").read_text().splitlines())
+        if set(requirements) <= available and (kit / ".ready").is_file():
+            (directory / "kit").mkdir()
+            for artifact in ("python312.tar.gz", "site-packages.tar.gz"):
+                shutil.copyfile(kit / artifact, directory / "kit" / artifact)
+
 
 
 def _dependencies(agent):
@@ -110,6 +118,14 @@ def _plain(value):
 def _setup_script(uv_installer_url="https://astral.sh/uv/0.11.4/install.sh"):
     """Install an independent harness Python without replacing task dependencies."""
     return f"""set -eu
+if [ -f {_ROOT}/kit/python312.tar.gz ]; then
+    mkdir -p {_ROOT}/python
+    tar -xzf {_ROOT}/kit/python312.tar.gz -C {_ROOT}/python
+    {_ROOT}/python/bin/python3.12 -m venv --without-pip {_ROOT}/venv
+    tar -xzf {_ROOT}/kit/site-packages.tar.gz -C {_ROOT}/venv/lib/python3.12/site-packages
+    rm -rf {_ROOT}/kit
+    exit 0
+fi
 case "$({_ROOT}/bin/uv --version 2>/dev/null || true)" in
     'uv 0.11.4'|'uv 0.11.4 ('*')') ;;
     *)

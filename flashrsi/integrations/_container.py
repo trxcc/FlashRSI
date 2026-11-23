@@ -82,6 +82,9 @@ async def _run(request_path: Path, output_path: Path) -> int:
                 )
             result = await agent.run(request["prompt"], working_dir=Path.cwd())
     except Exception as exc:
+        from flashrsi.core.infra import infra_reason
+
+        reason = infra_reason(exc)
         result = Trajectory(
             status="error",
             messages=(
@@ -90,8 +93,9 @@ async def _run(request_path: Path, output_path: Path) -> int:
                     "config": _config_record(config),
                     "snapshot_id": snapshot.id if snapshot is not None else None,
                 },
+                *(({"type": "InfraError", "reason": reason},) if reason else ()),
             ),
-            error_message=str(exc) or type(exc).__name__,
+            error_message=f"InfraError: {reason}" if reason else str(exc) or type(exc).__name__,
         )
 
     secrets = sorted(

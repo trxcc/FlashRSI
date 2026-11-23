@@ -32,11 +32,11 @@ def _entries(usage):
             yield from _entries(sample)
     elif usage.get("model_calls"):
         for call in usage["model_calls"]:
-            yield call.get("call_id"), call.get("usage") or {}
+            yield call.get("call_id") or call.get("session_id"), call.get("usage", call) or {}
     else:
         yield usage.get("session_id"), usage
     # These calls belong to this trajectory, unlike copies embedded in messages.
-    for key in ("benchmark_judge", "benchmark_postprocess"):
+    for key in ("benchmark_judge", "benchmark_postprocess", "judge_usage"):
         if usage.get(key):
             yield from _entries(usage[key])
 
@@ -249,6 +249,11 @@ def _write_run_summary(root, *, result=None, emit=True):
         "test_score",
         "primary_metric",
         "test_tasks",
+        "test_metrics",
+        "validation_metrics",
+        "metrics",
+        "mode",
+        "tasks",
         "baseline_test",
         "evolved_test",
         "paired_comparison",
@@ -273,8 +278,10 @@ def _write_run_summary(root, *, result=None, emit=True):
             .get("model_name"),
         }
     markdown = _render_summary(summary)
+    payload = json.dumps(summary, ensure_ascii=False, indent=2) + "\n"
     for name, content in (
-        ("end-summary.json", json.dumps(summary, ensure_ascii=False, indent=2) + "\n"),
+        ("summary.json", payload),
+        ("end-summary.json", payload),
         ("end-summary.md", markdown),
     ):
         temporary = root / (name + ".tmp")
