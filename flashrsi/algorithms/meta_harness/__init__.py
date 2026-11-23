@@ -8,13 +8,13 @@ Reference: reference_examples/{text_classification,terminal_bench_2}/meta_harnes
 from __future__ import annotations
 
 import json
-import shutil
 from contextlib import ExitStack
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from flashrsi.algorithms.meta_harness import _prompts as prompts
 from flashrsi.core import Algorithm, Snapshot
+from flashrsi.core.algorithm import _worker_evidence
 from flashrsi.core.snapshot import discard_runtime_files
 
 
@@ -108,9 +108,13 @@ class MetaHarness(Algorithm):
                 (history / "index.json").write_text(
                     json.dumps(index, ensure_ascii=False, indent=2), encoding="utf-8"
                 )
-                shutil.copytree(
-                    self._run_dir / "trajectories", history / "trajectories"
-                )
+                records = history / "trajectories"
+                records.mkdir()
+                for source in sorted((self._run_dir / "trajectories").glob("*.json")):
+                    public = _worker_evidence(json.loads(source.read_text(encoding="utf-8")))
+                    (records / source.name).write_text(
+                        json.dumps(public, ensure_ascii=False, indent=2), encoding="utf-8"
+                    )
                 await self.worker.edit(
                     directory,
                     prompts.PROPOSE.format(

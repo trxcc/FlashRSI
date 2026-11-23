@@ -231,7 +231,16 @@ def _validate(config: dict) -> None:
     _require_text(output_dir, "run.output_dir")
 
     split = config["benchmark"]["split"]
-    if split != "auto":
+    from flashrsi.benchmarks._suite import NAMES
+
+    native_split = config["benchmark"]["name"] in NAMES and split in (
+        "train",
+        "dev",
+        "val",
+        "test",
+        "sealed",
+    )
+    if split != "auto" and not native_split:
         if not isinstance(split, Mapping):
             raise ValueError("benchmark.split must be 'auto' or a mapping")
         _reject_unknown(split, _SPLIT_RATIOS, "benchmark.split")
@@ -244,6 +253,9 @@ def _validate(config: dict) -> None:
         if not math.isclose(sum(split.values()), 1.0, rel_tol=0, abs_tol=1e-9):
             raise ValueError("benchmark.split ratios must sum to 1")
         config["benchmark"]["split"] = split
+
+    if type(config["run"].get("smoke", False)) is not bool:
+        raise ValueError("run.smoke must be a boolean")
 
     mode = config["run"].get("mode", "run")
     if mode not in ("run", "evaluate"):

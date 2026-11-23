@@ -8,7 +8,8 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
-from flashrsi.core import Task
+from flashrsi.core import InfraError, Task
+from flashrsi.core.infra import trajectory_infra_reason
 
 
 def _grade(trajs, tasks_by_id, label):
@@ -17,6 +18,8 @@ def _grade(trajs, tasks_by_id, label):
         task = trajectory.task
         if task is None or tasks_by_id.get(task.task_id) != task:
             raise ValueError(f"{label} grading requires a loaded benchmark Task")
+        if reason := trajectory_infra_reason(trajectory):
+            raise InfraError(reason)
         reward = 0.0
         if trajectory.status == "finished":
             event = trajectory.messages[-1] if trajectory.messages else {}

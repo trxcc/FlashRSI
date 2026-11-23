@@ -1,4 +1,8 @@
-"""Dependency selection and resource preparation for the one-command launcher."""
+"""Plan dependencies and prepare resources for the one-command launcher.
+
+The host resolves independent model roles through FLASHRSI_<ROLE>_* overrides.
+Optional benchmark dependencies are imported inside their preparation steps.
+"""
 
 from __future__ import annotations
 
@@ -10,6 +14,7 @@ import sys
 from collections.abc import Mapping
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import Any
 
 import yaml
 
@@ -23,7 +28,8 @@ from flashrsi._startup import (
     _role,
     _supplied_context,
 )
-from flashrsi.config import load_config
+from flashrsi.benchmarks import _suite
+from flashrsi.config import Config, load_config
 
 # Every built-in benchmark has an entry, including those needing only base deps.
 # The table remains the source of benchmark-specific validation and preparation
@@ -61,6 +67,9 @@ _BENCHMARK_EXTRAS = {
     "appworld": ("appworld",),
     "bfcl": ("bfcl",),
     "tau3_banking": ("tau2",),
+    **{name: () for name in sorted(_suite.NAMES)},
+    "tb21_clean": ("harbor",),
+    "swegym_lite": ("swe-bench",),
 }
 _AGENT_EXTRAS = {
     "miniagent": "miniagent",
@@ -84,7 +93,7 @@ _EDITING_ALGORITHMS = {
 _TAU_REQUIREMENT = "tau2 @ git+https://github.com/sierra-research/tau2-bench.git@fc0055dc4e0a316c3f83133267fbd6faaa770992"
 
 
-def _load(path, snapshot=None):
+def _load(path: str | Path, snapshot: str | Path | None = None) -> Config:
     overrides = {}
     if snapshot is not None:
         overrides["run"] = {
@@ -128,7 +137,7 @@ def _load(path, snapshot=None):
 
     base_dir = Path(path).expanduser().absolute().parent
 
-    def absolute(value):
+    def absolute(value: Any) -> Any:
         if isinstance(value, Mapping):
             return {k: absolute(v) for k, v in value.items()}
         if isinstance(value, list):
@@ -152,10 +161,34 @@ def _load(path, snapshot=None):
     return config
 
 
-def _plan(config):
+def _plan(config: Config) -> dict[str, Any]:
     benchmark = config.benchmark.name
-    dataset = config.benchmark.get("dataset", {})
-    prepared = _hf_prepared(config.benchmark)
+    if benchmark not in _BENCHMARK_EXTRAS:
+        raise ValueError(
+            "Unsupported benchmark; choose: " + ", ".join(_BENCHMARK_EXTRAS)
+        )
+    target, worker = _plan_roles(config)
+    # Keep the public installation surface small: all non-Harbor integrations
+    # are installed together, while Harbor stays opt-in because its LiteLLM
+    # dependency conflicts with the external tau2-bench runtime.
+    extras = ["all"]
+    if benchmark in _HARBOR:
+        extras.append("harbor")
+    requirements, prerequisites = _plan_requirements(config, target, worker)
+    prerequisites.extend(_data_prerequisites(config))
+    return {
+        "algorithm": config.algorithm.name,
+        "agent": target,
+        "worker": worker,
+        "benchmark": benchmark,
+        "extras": extras,
+        "requirements": requirements,
+        "data": _plan_data(config),
+        "prerequisites": prerequisites,
+    }
+
+
+def _plan_roles(config: Config) -> tuple[str, str | None]:
     target = config.agent.name
     evaluating = config.run.get("mode") == "evaluate"
     worker = (
@@ -167,15 +200,13 @@ def _plan(config):
             else config.algorithm.worker.name
         )
     )
-    if benchmark not in _BENCHMARK_EXTRAS:
-        raise ValueError(
-            "Unsupported benchmark; choose: " + ", ".join(_BENCHMARK_EXTRAS)
-        )
     if target not in {
         "miniagent",
         "claude_code",
         "codex",
         "pi",
+        "pi_agent",
+        "program_search",
         "hermes",
         "openclaw",
         "opencode",
@@ -187,9 +218,7 @@ def _plan(config):
             or (config.algorithm.worker.type == "agent" and worker == "llm")
         )
     ):
-        raise ValueError(
-            "Choose miniagent, claude_code, codex, pi, hermes, openclaw or opencode for either role; jiuwenswarm is Target-only and llm is Worker-only"
-        )
+        raise ValueError("Choose a registered Target and a Worker-capable agent or llm")
     if not evaluating:
         algorithm_names = {
             getattr(algorithms, name).name for name in algorithms.__all__
@@ -205,14 +234,19 @@ def _plan(config):
             raise ValueError(
                 f"{config.algorithm.name} requires algorithm.worker.type: agent and worker.name"
             )
-    # Keep the public installation surface small: all non-Harbor integrations
-    # are installed together, while Harbor stays opt-in because its LiteLLM
-    # dependency conflicts with the external tau2-bench runtime.
-    extras = ["all"]
-    if benchmark in _HARBOR:
-        extras.append("harbor")
+    return target, worker
+
+
+def _plan_requirements(
+    config: Config, target: str, worker: str | None
+) -> tuple[list[str], list[str]]:
+    benchmark = config.benchmark.name
     requirements = []
     prerequisites = []
+    if benchmark in _suite.NAMES:
+        prerequisites.append(
+            "Frozen suite assets under benchmark.root or FLASHRSI_SUITE_ENVS_ROOT"
+        )
     if "codex" in {target, worker}:
         prerequisites.append(
             "Codex requires explicit API keys and a streaming Responses API endpoint"
@@ -256,6 +290,13 @@ def _plan(config):
                 "independent benchmark.judge.anthropic/openai credentials",
             ]
         )
+    return requirements, prerequisites
+
+
+def _data_prerequisites(config: Config) -> list[str]:
+    benchmark = config.benchmark.name
+    prepared = _hf_prepared(config.benchmark)
+    prerequisites = []
     if benchmark == "officeqa_pro":
         prerequisites.append(
             "Authorized data access and benchmark.corpus_path containing public documents"
@@ -290,27 +331,24 @@ def _plan(config):
         prerequisites.extend(["Python >=3.12", "Git for pinned native tools and data"])
     if benchmark == "travelplanner":
         prerequisites.append("Independent benchmark.postprocess.llm configuration")
-    return {
-        "algorithm": config.algorithm.name,
-        "agent": target,
-        "worker": worker,
-        "benchmark": benchmark,
-        "extras": extras,
-        "requirements": requirements,
-        "data": f"download/reuse HF prepared {dataset['config']} at {dataset.get('revision')}"
-        if prepared
-        else "use explicit local data"
-        if config.benchmark.get("data_path")
-        else (
-            "provide local ALFWorld benchmark.data_path"
-            if benchmark == "alfworld"
-            else "download/reuse native upstream data"
-        ),
-        "prerequisites": prerequisites,
-    }
+    return prerequisites
 
 
-def _validate_roles(config):
+def _plan_data(config: Config) -> str:
+    benchmark = config.benchmark.name
+    if _hf_prepared(config.benchmark):
+        dataset = config.benchmark["dataset"]
+        return f"download/reuse HF prepared {dataset['config']} at {dataset.get('revision')}"
+    if benchmark in _suite.NAMES:
+        return "use frozen local suite assets"
+    if config.benchmark.get("data_path"):
+        return "use explicit local data"
+    if benchmark == "alfworld":
+        return "provide local ALFWorld benchmark.data_path"
+    return "download/reuse native upstream data"
+
+
+def _validate_roles(config: Config) -> None:
     _role(config.agent, "agent", config.agent.name)
     if config.run.get("mode") != "evaluate":
         worker = config.algorithm.worker
@@ -319,7 +357,7 @@ def _validate_roles(config):
         )
 
 
-def _validate_host(config):
+def _validate_host(config: Config) -> None:
     name = config.benchmark.name
     if name in _HARBOR and sys.version_info < (3, 12):
         raise ValueError(
@@ -376,75 +414,19 @@ def _validate_host(config):
         raise ValueError("tau on Windows requires PYTHONUTF8=1 before starting Python")
 
 
-async def _resources(config, cache):
-    from filelock import FileLock
-
-    from flashrsi.integrations._docker import _docker
-
+async def _resources(config: Config, cache: Path) -> None:
     name = config.benchmark.name
     prepared = _hf_prepared(config.benchmark)
     if _requires_docker(config.benchmark):
         await _check_docker(name, config.benchmark, images=False)
     if name in {"appworld", "bfcl"}:
-        from importlib import import_module
-
-        integration = import_module(f"flashrsi.integrations.{name}")
-        image = config.benchmark.get("image", integration._IMAGE)
-        result = await _docker("image", "inspect", image, timeout=15, check=False)
-        if result.returncode:
-            if image == integration._IMAGE:
-                dockerfile = Path(integration.__file__).with_name(f"{name}.Dockerfile")
-                print(f"Building {name} runtime image...", flush=True)
-                await _docker(
-                    "build",
-                    "-f",
-                    str(dockerfile),
-                    "-t",
-                    image,
-                    str(dockerfile.parent),
-                    timeout=3600,
-                )
-            else:
-                print(f"Pulling configured {name} image...", flush=True)
-                await _docker("pull", image, timeout=3600)
+        image = await _prepare_runtime_image(config.benchmark)
         if (
             name == "appworld"
             and not prepared
             and not config.benchmark.get("data_path")
         ):
-            parent = cache / "data"
-            parent.mkdir(parents=True, exist_ok=True)
-            destination = parent / "appworld-0.1.3.post1"
-            with FileLock(str(destination) + ".lock"):
-                if not destination.exists():
-                    with TemporaryDirectory(
-                        prefix=".appworld-", dir=parent
-                    ) as temporary:
-                        root = Path(temporary)
-                        print("Downloading AppWorld native data...", flush=True)
-                        await _docker(
-                            "run",
-                            "--rm",
-                            "--workdir",
-                            "/world",
-                            "--mount",
-                            f"type=bind,source={root},target=/world",
-                            image,
-                            "appworld",
-                            "download",
-                            "data",
-                            timeout=3600,
-                        )
-                        data = root / "data"
-                        if not all(
-                            (data / part).is_dir()
-                            for part in ("datasets", "tasks", "base_dbs")
-                        ):
-                            raise ValueError(
-                                "AppWorld downloader did not produce a complete native data directory"
-                            )
-                        data.rename(destination)
-            config.benchmark.data_path = str(destination)
+            config.benchmark.data_path = str(await _prepare_appworld_data(cache, image))
     if (
         name in {"tau2", "tau3_banking"}
         and not prepared
@@ -462,16 +444,87 @@ async def _resources(config, cache):
         os.environ["PATH"] = directory + os.pathsep + os.environ.get("PATH", "")
 
 
-def _run(path, check_only, cache, snapshot=None):
+async def _prepare_runtime_image(benchmark: Config) -> str:
+    from flashrsi.integrations._docker import _docker
+
+    name = benchmark.name
+    from importlib import import_module
+
+    integration = import_module(f"flashrsi.integrations.{name}")
+    image = benchmark.get("image", integration._IMAGE)
+    result = await _docker("image", "inspect", image, timeout=15, check=False)
+    if result.returncode:
+        if image == integration._IMAGE:
+            dockerfile = Path(integration.__file__).with_name(f"{name}.Dockerfile")
+            print(f"Building {name} runtime image...", flush=True)
+            await _docker(
+                "build",
+                "-f",
+                str(dockerfile),
+                "-t",
+                image,
+                str(dockerfile.parent),
+                timeout=3600,
+            )
+        else:
+            print(f"Pulling configured {name} image...", flush=True)
+            await _docker("pull", image, timeout=3600)
+    return image
+
+
+async def _prepare_appworld_data(cache: Path, image: str) -> Path:
+    from filelock import FileLock
+
+    from flashrsi.integrations._docker import _docker
+
+    parent = cache / "data"
+    parent.mkdir(parents=True, exist_ok=True)
+    destination = parent / "appworld-0.1.3.post1"
+    with FileLock(str(destination) + ".lock"):
+        if not destination.exists():
+            with TemporaryDirectory(prefix=".appworld-", dir=parent) as temporary:
+                root = Path(temporary)
+                print("Downloading AppWorld native data...", flush=True)
+                await _docker(
+                    "run",
+                    "--rm",
+                    "--workdir",
+                    "/world",
+                    "--mount",
+                    f"type=bind,source={root},target=/world",
+                    image,
+                    "appworld",
+                    "download",
+                    "data",
+                    timeout=3600,
+                )
+                data = root / "data"
+                if not all(
+                    (data / part).is_dir() for part in ("datasets", "tasks", "base_dbs")
+                ):
+                    raise ValueError(
+                        "AppWorld downloader did not produce a complete native data directory"
+                    )
+                data.rename(destination)
+    return destination
+
+
+def _run(
+    path: str | Path,
+    check_only: bool,
+    cache: str | Path,
+    snapshot: str | Path | None = None,
+) -> int:
     config = None
     try:
         config = _load(path, snapshot)
+        _suite.guard(config.benchmark)
         _plan(config)
         _validate_roles(config)
         _validate_host(config)
         logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
-        async def execute():
+        async def execute() -> None:
             from flashrsi.runner import _evaluate, _prepare, _prepare_evaluation
             from flashrsi.runner import _run as run_experiment
 

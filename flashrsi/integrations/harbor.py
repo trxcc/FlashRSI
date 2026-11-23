@@ -1,19 +1,26 @@
-"""Run an existing FlashRSI adapter inside one native Harbor trial."""
+"""Run a FlashRSI snapshot inside a native Harbor trial.
+
+Harbor execution requires the optional Harbor extra and Docker Compose.
+The host controls trial setup and collects verifier results and artifacts.
+"""
 
 from __future__ import annotations
 
+import asyncio
 import copy
-import hashlib
 import json
 import math
 import os
 import shlex
 import shutil
 import sys
-from dataclasses import replace
+from contextlib import ExitStack
+from contextvars import ContextVar
+from dataclasses import dataclass, replace
 from importlib.metadata import version
 from pathlib import Path
-from tempfile import TemporaryDirectory, mkdtemp
+from tempfile import TemporaryDirectory
+from typing import Any
 
 if sys.version_info < (3, 12):
     raise ImportError("Harbor execution requires Python 3.12 or newer")
@@ -21,6 +28,7 @@ if sys.version_info < (3, 12):
 try:
     from harbor.agents.base import BaseAgent
     from harbor.agents.installed.base import NonZeroAgentExitCodeError
+    from harbor.environments.docker.docker import DockerEnvironment
     from harbor.models.task.task import Task as HarborTask
     from harbor.models.task.verifier_mode import (
         VerifierEnvironmentMode,
@@ -34,21 +42,44 @@ try:
         VerifierConfig,
     )
     from harbor.models.trial.paths import EnvironmentPaths
+    from harbor.models.trial.result import TrialResult
     from harbor.trial.hooks import TrialEvent
     from harbor.trial.trial import Trial
 except ImportError as exc:
     raise ImportError("Install flashrsi-lite[harbor] for environment tasks") from exc
 
 from flashrsi._records import _config_record, _redact, _secrets
-from flashrsi.core import Trajectory
+from flashrsi.core import Agent, InfraError, Task, Trajectory
+from flashrsi.core.infra import infra_reason, trajectory_infra_reason
 from flashrsi.integrations._container import _agent_class
 from flashrsi.integrations._container_payload import _plain, _setup_script
 from flashrsi.integrations._container_payload import _stage as _stage_payload
+from flashrsi.integrations._docker import _docker
+from flashrsi.integrations._harbor_remote import _RemoteDockerEnvironment
+from flashrsi.integrations.harbor_suite import (
+    _CONTAINER_SHELLS,
+    _RELAY_BRIDGE,
+    _RUNTIME,
+    _archive_trial,
+    _container_python,
+    _read_trial_result,
+    _redacted_trajectory,
+    _relay_shell_env,
+    _shell_turns,
+    _stage_native,
+    _stage_runtime,
+    _trial_artifacts,
+)
+from flashrsi.integrations.harbor_suite import (
+    _RELAY_MOUNT as _RELAY_MOUNT,
+)
 
 _ROOT = "/opt/flashrsi-lite"
+_RELAY_ENDPOINT = "http://127.0.0.1:28451"
+_CLEANUP_FAILURES = ContextVar("harbor_cleanup_failures", default=None)
 
 
-def bind(agent):
+def bind(agent: Agent) -> None:
     """Connect an Agent to Harbor; CLI runs do this in the runner.
 
     The adapter must be importable in the container. Built-ins travel with the
@@ -66,12 +97,16 @@ def bind(agent):
     agent._env_runner = _run
 
 
-async def _run(agent, task, *, verifier_env=None, agent_allowed_hosts=None):
-    """The caller's rollout has already pinned its Snapshot and configuration."""
-    if shutil.which("docker") is None:
-        raise ValueError("Harbor execution requires Docker with the Compose plugin")
-    agent._check_container()
-    native = HarborTask(Path(task.env))
+async def _load_task(task: Task, strict: bool | None) -> tuple[HarborTask, str]:
+    try:
+        native = HarborTask(Path(task.env))
+    except (OSError, ValueError) as exc:
+        raise InfraError(
+            f"{task.task_id}: cannot load Harbor assets at {task.env}: {exc}. "
+            "Stage the reviewed Harbor task directory and task.toml."
+        ) from None
+    if strict:
+        await _preflight_image(task, native)
     if native.config.steps or native.config.environment.os.value != "linux":
         raise ValueError("This integration supports single-step Linux Harbor tasks")
     if native.instruction != task.question:
@@ -80,19 +115,52 @@ async def _run(agent, task, *, verifier_env=None, agent_allowed_hosts=None):
     if task.metadata.get("task_checksum", checksum) != checksum:
         raise ValueError("Harbor task files changed after benchmark.load()")
 
-    snapshot = agent.snapshot
+    return native, checksum
+
+
+@dataclass(frozen=True, slots=True)
+class _TrialPlan:
+    config: dict[str, Any]
+    options: dict[str, Any]
+    strict: bool | None
+    mounted_runtime: bool
+    shared_verifier: bool
+    environment_import: str | None
+    installer: str
+    multiplier: float
+    fallback_timeout: float | None
+    setup_timeout: float
+    grace: float
+    native_build: float
+    build_timeout: float
+    outer_timeout: float | None
+
+
+def _plan_trial(agent: Agent, native: HarborTask, strict: bool | None) -> _TrialPlan:
+    from flashrsi.integrations._terminal_integrity import validate
+    from flashrsi.integrations.sandbox_runtime import RELAY, local_config, route_config
+
     config = copy.deepcopy(agent.config)
     options = config.get("harbor", {})
-    from flashrsi.integrations._terminal_integrity import validate
-
     validate(options.get("integrity_review"))
     remote_docker = options.get("remote_docker", False)
     if not isinstance(remote_docker, bool):
         raise ValueError("harbor.remote_docker must be a boolean")
-    shared_verifier = (
-        resolve_task_verifier_mode(native.config) == VerifierEnvironmentMode.SHARED
+    mounted_runtime = (
+        not remote_docker
+        and (strict is not None or RELAY.get() is not None)
+        and getattr(agent, "name", None) in _CONTAINER_SHELLS
     )
-    environment_import = _docker_environment_import(native, remote_docker)
+    if mounted_runtime:
+        config = local_config(agent, _RELAY_ENDPOINT)
+        config["_suite_model_relay"] = True
+        config["llm"].pop("side_base_url", None)
+        config["llm"].pop("side_api_key", None)
+    else:
+        config = route_config(agent, config)
+    _shell_turns(agent, config)
+    shared_verifier = resolve_task_verifier_mode(native.config) == VerifierEnvironmentMode.SHARED
+    environment_import = None if mounted_runtime else _docker_environment_import(native, remote_docker)
     install_source = options.get("uv_install_source", "astral")
     installers = {
         "astral": "https://astral.sh/uv/0.11.4/install.sh",
@@ -100,178 +168,232 @@ async def _run(agent, task, *, verifier_env=None, agent_allowed_hosts=None):
     }
     if not isinstance(install_source, str) or install_source not in installers:
         raise ValueError("harbor.uv_install_source must be astral or github")
-    timeout = _positive(
-        config.get("timeout", native.config.agent.timeout_sec or 300), "timeout"
+    multiplier = _positive(options.get("timeout_multiplier", 1.0), "harbor.timeout_multiplier")
+    native_timeout = native.config.agent.timeout_sec
+    # Legacy tasks without an explicit deadline can use the configured agent timeout.
+    fallback_timeout = config.get("timeout") if native_timeout is None else None
+    agent_timeout = native_timeout if native_timeout is not None else fallback_timeout
+    setup_timeout = _positive(options.get("setup_timeout", 360), "harbor.setup_timeout")
+    grace = _positive(options.get("cleanup_grace", 60), "harbor.cleanup_grace")
+    native_build = _positive(
+        getattr(native.config.environment, "build_timeout_sec", 600), "harbor native build timeout",
     )
-    setup_timeout = _positive(options.get("setup_timeout", 600), "harbor.setup_timeout")
-    grace = _positive(options.get("cleanup_grace", 30), "harbor.cleanup_grace")
-    config["timeout"] = timeout
+    build_timeout = _positive(options.get("build_timeout", native_build), "harbor.build_timeout")
+    outer_timeout = None
+    if agent_timeout is not None:
+        timeout = _positive(
+            _positive(agent_timeout, "harbor agent timeout") * multiplier,
+            "harbor effective agent timeout",
+        )
+        config["timeout"] = timeout
+        verifier_timeout = getattr(getattr(native.config, "verifier", None), "timeout_sec", 600)
+        environments = 1 if shared_verifier else 2
+        outer_timeout = timeout + setup_timeout + verifier_timeout + environments * (build_timeout + grace) + grace
+    return _TrialPlan(
+        config, options, strict, mounted_runtime, shared_verifier, environment_import,
+        installers[install_source], multiplier, fallback_timeout, setup_timeout, grace,
+        native_build, build_timeout, outer_timeout,
+    )
+
+
+def _trial_config(
+    task: Task, plan: _TrialPlan, root: Path, payload: Path, python: str | None, compose: list[Path],
+    verifier_env: dict[str, str] | None, agent_allowed_hosts: list[str] | None, secrets: list[str],
+) -> TrialConfig:
+    environment_env = _plain(plan.options.get("environment_env", {}))
+    if plan.mounted_runtime:
+        environment_env = _redact(environment_env, secrets)
+    trials_dir = plan.options.get("trials_dir")
+    environment_class = "_TimedRemoteDockerEnvironment" if plan.environment_import else "_TimedDockerEnvironment"
+    return TrialConfig(
+        task=TaskConfig(path=Path(task.env)),
+        trials_dir=Path(trials_dir).expanduser().resolve() if trials_dir else root / "trials",
+        timeout_multiplier=plan.multiplier,
+        verifier_timeout_multiplier=1.0,
+        agent_setup_timeout_multiplier=1.0,
+        environment_build_timeout_multiplier=plan.build_timeout / plan.native_build,
+        agent=AgentConfig(
+            import_path="flashrsi.integrations.harbor:_SnapshotAgent",
+            model_name=plan.config["llm"]["model_name"],
+            override_timeout_sec=plan.fallback_timeout,
+            override_setup_timeout_sec=plan.setup_timeout,
+            extra_allowed_hosts=agent_allowed_hosts or [],
+            kwargs={"payload_dir": str(payload), "uv_installer_url": plan.installer, "runtime_python": python},
+        ),
+        environment=EnvironmentConfig(
+            type="docker", delete=True, env=environment_env, extra_docker_compose=compose,
+            import_path=f"flashrsi.integrations.harbor:{environment_class}",
+            kwargs={"cleanup_grace": plan.grace, "require_local_images": bool(plan.strict)},
+        ),
+        verifier=VerifierConfig(env=verifier_env or {}),
+    )
+
+
+async def _execute_trial(trial: Trial, plan: _TrialPlan) -> TrialResult:
+    if plan.shared_verifier:
+        async def prepare_verifier(_event):
+            await _prepare_shared_verifier(trial.agent_environment)
+
+        trial.add_hook(TrialEvent.VERIFICATION_START, prepare_verifier)
+    cleanup_failures = []
+    token = _CLEANUP_FAILURES.set(cleanup_failures)
+    try:
+        async with asyncio.timeout(plan.outer_timeout):
+            result = await trial.run()
+        if cleanup_failures:
+            raise InfraError(f"Harbor environment cleanup failed: {cleanup_failures[0]}")
+        return result
+    finally:
+        _CLEANUP_FAILURES.reset(token)
+
+
+async def _run(
+    agent: Agent, task: Task, *, verifier_env: dict[str, str] | None = None,
+    agent_allowed_hosts: list[str] | None = None,
+) -> Trajectory:
+    """The caller's rollout has already pinned its Snapshot and configuration."""
+    strict = task.metadata.get("suite_require_local_image")
+    if task.env is None:
+        raise ValueError("Harbor execution requires task.env")
+    if shutil.which("docker") is None:
+        raise InfraError(f"{task.task_id}: Harbor requires Docker with the Compose plugin")
+    agent._check_container()
+    native, checksum = await _load_task(task, strict)
+    snapshot = agent.snapshot
+    plan = _plan_trial(agent, native, strict)
     secrets = sorted(
-        set(_secrets(config) + _secrets(os.environ) + _secrets(verifier_env)),
-        key=len,
-        reverse=True,
+        set(_secrets(agent.config) + _secrets(plan.config) + _secrets(os.environ) + _secrets(verifier_env)),
+        key=len, reverse=True,
     )
-    record = {
-        "type": "RunConfig",
-        "config": _config_record(config),
-        "snapshot_id": snapshot.id,
-    }
-    trajectory = Trajectory(messages=(record,))
+    trajectory = Trajectory(messages=({
+        "type": "RunConfig", "config": _config_record(plan.config), "snapshot_id": snapshot.id,
+    },))
     event = {
         "type": "HarborVerifier",
-        "verifier_environment_mode": "shared" if shared_verifier else "separate",
-        "host_log_transport": "copy" if environment_import else "mount",
+        "verifier_environment_mode": "shared" if plan.shared_verifier else "separate",
+        "host_log_transport": "copy" if plan.environment_import else "mount",
         "task_id": task.task_id,
         "task_checksum": checksum,
         "snapshot_id": snapshot.id,
     }
-
-    with TemporaryDirectory(prefix="flashrsi-harbor-") as temporary:
+    with TemporaryDirectory(prefix="flashrsi-harbor-") as temporary, ExitStack() as resources:
         root = Path(temporary)
         payload = root / "payload"
         payload.mkdir(mode=0o700)
-        _stage(payload, agent, config, task.question)
         trial = None
         try:
-            trial = await Trial.create(
-                TrialConfig(
-                    task=TaskConfig(path=Path(task.env)),
-                    trials_dir=(
-                        Path(options["trials_dir"]).expanduser().resolve()
-                        if options.get("trials_dir")
-                        else root / "trials"
-                    ),
-                    agent=AgentConfig(
-                        import_path="flashrsi.integrations.harbor:_SnapshotAgent",
-                        model_name=config["llm"]["model_name"],
-                        override_timeout_sec=timeout + grace,
-                        override_setup_timeout_sec=setup_timeout,
-                        extra_allowed_hosts=agent_allowed_hosts or [],
-                        kwargs={
-                            "payload_dir": str(payload),
-                            "uv_installer_url": installers[install_source],
-                        },
-                    ),
-                    environment=EnvironmentConfig(
-                        type="docker",
-                        delete=True,
-                        env=_plain(options.get("environment_env", {})),
-                        import_path=environment_import,
-                    ),
-                    verifier=VerifierConfig(env=verifier_env or {}),
-                )
-            )
-            if shared_verifier:
-
-                async def prepare_verifier(_event):
-                    await _prepare_shared_verifier(trial.agent_environment)
-
-                trial.add_hook(TrialEvent.VERIFICATION_START, prepare_verifier)
-            # Harbor owns environment setup, phase deadlines, verifier and cleanup.
-            result = await trial.run()
-            output = trial.paths.agent_dir / "flashrsi.json"
-            if output.is_file():
-                values = json.loads(output.read_text())
-                values.pop("task", None)
-                trajectory = Trajectory(**values)
-                if not any(
-                    message.get("type") == "RunConfig"
-                    and message.get("snapshot_id") == snapshot.id
-                    for message in trajectory.messages
-                ):
-                    raise ValueError(
-                        "Container result does not identify the requested Snapshot"
-                    )
-            elif result.exception_info is None:
-                raise ValueError("Harbor agent ended without a FlashRSI trajectory")
-            event["trial_id"] = str(result.id)
-            event["rewards"] = (
-                result.verifier_result.rewards
-                if result.verifier_result is not None
-                else None
-            )
-            event["stdout"] = _read_log(trial.paths.test_stdout_path)
-            event["stderr"] = _read_log(trial.paths.test_stderr_path)
-            if result.exception_info is not None:
-                event["exception_type"] = result.exception_info.exception_type
-                error = (
-                    result.exception_info.exception_message
-                    or result.exception_info.exception_type
-                )
-                event["error"] = error
-                trajectory = replace(
-                    trajectory,
-                    status="error",
-                    error_message=trajectory.error_message or error,
-                )
-            elif trajectory.status == "finished" and event["rewards"] is None:
-                raise ValueError("Harbor verifier ended without rewards")
+            python, compose = None, []
+            if plan.mounted_runtime:
+                python, compose = _stage_runtime(root, resources, agent, plan.config)
+            if plan.mounted_runtime:
+                _stage(payload, agent, plan.config, task.question, native=True)
+            else:
+                _stage(payload, agent, plan.config, task.question)
+            trial = await Trial.create(_trial_config(
+                task, plan, root, payload, python, compose, verifier_env, agent_allowed_hosts, secrets,
+            ))
+            result = await _execute_trial(trial, plan)
+            trajectory = _read_trial_result(trial, result, trajectory, event, snapshot.id)
         except Exception as exc:
-            error = str(exc) or type(exc).__name__
-            event["error"] = error
+            error = str(exc) or (
+                "Harbor trial exceeded its outer deadline" if isinstance(exc, TimeoutError)
+                else type(exc).__name__
+            )
+            event.update(error=error, infra_error=infra_reason(exc) or error)
             trajectory = replace(trajectory, status="error", error_message=error)
         finally:
             if trial is not None:
                 try:
-                    if options.get("trials_dir"):
-                        # Use Harbor's own collected outputs, outside the temporary payload
-                        # and Snapshot. Bind retained bytes to the evaluated version/task.
-                        directory = trial.paths.trial_dir.resolve()
-                        event["trial_directory"] = str(directory)
-                        event["files"] = {
-                            str(file.relative_to(directory)): hashlib.sha256(
-                                file.read_bytes()
-                            ).hexdigest()
-                            for folder in (
-                                trial.paths.artifacts_dir,
-                                trial.paths.verifier_dir,
-                            )
-                            for file in sorted(folder.rglob("*"))
-                            if file.is_file()
-                            and not file.is_symlink()
-                            and file.resolve().is_relative_to(directory)
-                        }
-                    event["artifacts"] = _archive_trial(
-                        trial,
-                        options.get("artifacts_dir", "runs/artifacts/harbor"),
-                        {**event, "snapshot_id": snapshot.id},
-                        secrets,
-                    )
+                    _trial_artifacts(trial, plan.options, event, secrets, archive=_archive_trial)
                 except Exception as exc:
                     event["artifact_error"] = str(exc)
+                    event.setdefault("infra_error", "Harbor artifact archive failed")
                     trajectory = replace(
-                        trajectory,
-                        status="error",
-                        error_message="Harbor artifact archive failed: " + str(exc),
+                        trajectory, status="error", error_message=f"Harbor artifact archive failed: {exc}",
                     )
-        review_options = options.get("integrity_review")
-        if review_options is not None:
-            from flashrsi.integrations._terminal_integrity import review
-
-            # Outside the solver exception path: retry the judge, not the task.
-            event = _redact(event, secrets)
-            await review(
-                task,
-                replace(
-                    trajectory,
-                    output=_redact(trajectory.output, secrets),
-                    messages=_redact(trajectory.messages, secrets),
-                    usage=_redact(trajectory.usage, secrets),
-                    error_message=_redact(trajectory.error_message, secrets),
-                ),
-                event,
-                review_options,
-            )
-        return replace(
-            trajectory,
-            output=_redact(trajectory.output, secrets),
-            messages=_redact((*trajectory.messages, event), secrets),
-            usage=_redact(trajectory.usage, secrets),
-            error_message=_redact(trajectory.error_message, secrets),
-        )
+        return await _finish_trial(task, native, plan, trajectory, event, secrets)
 
 
-def _docker_environment_import(native, remote_docker=False):
+async def _finish_trial(
+    task: Task, native: HarborTask, plan: _TrialPlan, trajectory: Trajectory,
+    event: dict[str, Any], secrets: list[str],
+) -> Trajectory:
+    if plan.strict is not None and event.get("infra_error"):
+        detail = _redact(event.get("error", event["infra_error"]), secrets)
+        image = getattr(native.config.environment, "docker_image", None)
+        assets = f"{task.env}/environment" + (f" and image {image}" if image else "")
+        raise InfraError(
+            f"{task.task_id}: Harbor execution failed: {detail}. "
+            f"Check staged assets at {assets} and the Docker daemon."
+        ) from None
+    review_options = plan.options.get("integrity_review")
+    if review_options is not None:
+        from flashrsi.integrations._terminal_integrity import review
+
+        event = _redact(event, secrets)
+        await review(task, _redacted_trajectory(trajectory, secrets), event, review_options)
+    return _redacted_trajectory(trajectory, secrets, event)
+
+
+async def _preflight_image(task: Task, native: HarborTask) -> None:
+    image = native.config.environment.docker_image
+    if image:
+        try:
+            await _docker("image", "inspect", "--format", "{{.Id}}", image, timeout=30)
+        except Exception as exc:
+            # Docker inspection can include image environment data. Never echo it.
+            reason = infra_reason(exc) or "image is unavailable locally"
+            raise InfraError(
+                f"{task.task_id}: Harbor image {image}: {reason}. "
+                "Stage the pinned image on the active Docker daemon (pull or load it)."
+            ) from None
+
+
+class _TimedCleanup:
+    def __init__(self, *args, cleanup_grace, require_local_images, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._cleanup_grace = cleanup_grace
+        self._require_local_images = require_local_images
+        self._cleanup_failure = None
+        self._stopping = False
+
+    async def _run_docker_compose_command(self, args, *options, **kwargs):
+        if self._require_local_images and args[0] == "up":
+            args = ["up", "--pull=never", *args[1:]]
+        try:
+            return await super()._run_docker_compose_command(args, *options, **kwargs)
+        except Exception as exc:
+            if self._stopping and args[0] in {"down", "stop"}:
+                self._cleanup_failure = exc
+            raise
+
+    async def stop(self, delete):
+        self._cleanup_failure = None
+        self._stopping = True
+        try:
+            async with asyncio.timeout(self._cleanup_grace):
+                await super().stop(delete=delete)
+            if self._cleanup_failure is not None:
+                raise self._cleanup_failure
+        except Exception as exc:
+            # Harbor logs separate-verifier stop failures without setting
+            # exception_info. Capture them in this trial's execution context.
+            if (failures := _CLEANUP_FAILURES.get()) is not None:
+                failures.append(str(exc) or type(exc).__name__)
+            raise
+        finally:
+            self._stopping = False
+
+
+class _TimedDockerEnvironment(_TimedCleanup, DockerEnvironment):
+    pass
+
+
+class _TimedRemoteDockerEnvironment(_TimedCleanup, _RemoteDockerEnvironment):
+    pass
+
+
+def _docker_environment_import(native: HarborTask, remote_docker: bool = False) -> str | None:
     shared = resolve_task_verifier_mode(native.config) == VerifierEnvironmentMode.SHARED
     if remote_docker or (
         not (native.paths.environment_dir / "docker-compose.yaml").exists()
@@ -295,76 +417,13 @@ async def _prepare_shared_verifier(environment):
             raise RuntimeError("Cannot clear Harbor verifier inputs and rewards")
 
 
-def _positive(value, field):
+def _positive(value: Any, field: str) -> float:
     if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
         raise ValueError(f"agent.{field} must be a positive finite number")
     return value
 
 
-def _read_log(path):
-    return path.read_text(errors="replace") if path.is_file() else ""
-
-
-def _archive_trial(trial, directory, metadata, secrets):
-    """Keep native outputs before temporary cleanup, without staging credentials."""
-    directory = Path(directory).expanduser().resolve()
-    directory.mkdir(parents=True, exist_ok=True)
-    saved = Path(mkdtemp(prefix="trial-", dir=directory))
-    record = {"directory": str(saved), "files": []}
-    try:
-        # Never copy the trial's config/lock or our payload: those can contain
-        # solver and verifier credentials. Harbor already collected these outputs.
-        for source in (
-            trial.paths.artifacts_dir,
-            trial.paths.verifier_dir,
-            trial.paths.agent_dir,
-            trial.paths.result_path,
-        ):
-            if source.is_symlink() or source.is_junction():
-                raise ValueError(f"Refusing linked artifact: {source}")
-            if not source.exists():
-                continue
-            paths = sorted(source.rglob("*")) if source.is_dir() else [source]
-            for path in paths:
-                if path.is_symlink() or path.is_junction():
-                    raise ValueError(f"Refusing linked artifact: {path}")
-                if not path.is_file():
-                    continue
-                relative = path.relative_to(trial.paths.trial_dir)
-                destination = saved / relative
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                data = path.read_bytes()
-                if path.name == "model.patch" and any(
-                    secret.encode() in data for secret in secrets
-                ):
-                    raise ValueError(
-                        "Refusing to archive a patch containing configured credentials"
-                    )
-                # Deliverables (including patches) must remain reproducible.
-                # Redact native logs, not the files that the verifier evaluated.
-                if source != trial.paths.artifacts_dir and path.name != "model.patch":
-                    try:
-                        text = data.decode("utf-8")
-                    except UnicodeDecodeError:
-                        pass
-                    else:
-                        if "\0" not in text:
-                            data = _redact(text, secrets).encode("utf-8")
-                destination.write_bytes(data)
-                record["files"].append(relative.as_posix())
-    except Exception as exc:
-        record["error"] = str(exc)
-        raise RuntimeError(f"Could not archive outputs to {saved}: {exc}") from exc
-    finally:
-        # Also identify partial archives when a trial fails or is cancelled.
-        (saved / "manifest.json").write_text(
-            json.dumps(_redact({**metadata, **record}, secrets), ensure_ascii=False),
-            encoding="utf-8",
-        )
-    return record
-
-
-def _stage(directory, agent, config, prompt):
+def _stage(directory: Path, agent: Agent, config: dict[str, Any], prompt: str, *, native: bool = False) -> None:
     config = copy.deepcopy(config)
     config.get("harbor", {}).pop("integrity_review", None)
     config.get("harbor", {}).pop("artifacts_dir", None)
@@ -381,7 +440,8 @@ def _stage(directory, agent, config, prompt):
         "is permitted. Tests and source files explicitly supplied as task inputs "
         "may be inspected; this does not permit fetching hidden benchmark files."
     )
-    _stage_payload(directory, agent, config, prompt)
+    stage = _stage_native if native else _stage_payload
+    stage(directory, agent, config, prompt)
 
 
 class _SnapshotAgent(BaseAgent):
@@ -393,44 +453,54 @@ class _SnapshotAgent(BaseAgent):
         payload_dir,
         uv_installer_url="https://astral.sh/uv/0.11.4/install.sh",
         working_dir=None,
+        runtime_python=None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self.payload_dir = Path(payload_dir)
         self.uv_installer_url = uv_installer_url
         self.working_dir = working_dir
+        self.runtime_python = runtime_python
 
     @staticmethod
-    def name():
+    def name() -> str:
         return "flashrsi-lite"
 
-    def version(self):
+    def version(self) -> str:
         return version("flashrsi-lite")
 
-    async def setup(self, environment):
+    async def setup(self, environment) -> None:
         await environment.upload_dir(self.payload_dir, _ROOT)
         # uv installs the requested Python independently of a task's Python.
         # Minimal Debian/Ubuntu task images may not include a downloader yet.
-        command = _setup_script(self.uv_installer_url)
+        command = (
+            shlex.join([self.runtime_python, "-I", "-B", "--version"])
+            if self.runtime_python else _setup_script(self.uv_installer_url)
+        )
         result = await environment.exec(command)
         if result.return_code:
             raise RuntimeError(
                 f"Container dependency setup failed: {result.stderr or result.stdout}"
             )
 
-    async def run(self, instruction, environment, context):
-        command = shlex.join(
-            [
-                f"{_ROOT}/venv/bin/python",
-                "-I",
-                "-c",
-                f"import sys; sys.path.insert(0, {_ROOT + '/package'!r}); "
-                "import runpy; runpy.run_module('flashrsi.integrations._container', "
-                "run_name='__main__', alter_sys=True)",
-                f"{_ROOT}/request.json",
-                str(self.environment_logs_dir / "flashrsi.json"),
-            ]
-        )
+    async def run(self, instruction, environment, context) -> None:
+        native = self.runtime_python is not None
+        python = self.runtime_python or f"{_ROOT}/venv/bin/python"
+        args = _container_python(python, str(self.environment_logs_dir / "flashrsi.json"), native=native)
+        command = shlex.join(args)
+        if native:
+            environment_vars = _relay_shell_env(_RELAY_ENDPOINT)
+            command = (
+                f"export PATH={_RUNTIME}/bin:$PATH; "
+                + shlex.join(["env", *(f"{key}={value}" for key, value in environment_vars.items()),
+                              python, "-I", "-B", "-c", _RELAY_BRIDGE, *args])
+            )
+        else:
+            from flashrsi.integrations.sandbox_runtime import relay_harbor
+
+            if await relay_harbor(environment):
+                command = ("env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY "
+                           "-u http_proxy -u https_proxy -u all_proxy " + command)
         command = getattr(self, "_command_prefix", "") + command
         # Isolate bridge imports without changing the task's cwd or PYTHONPATH;
         # native tools inherit the image's environment. The entry point removes
@@ -447,6 +517,12 @@ class _SnapshotAgent(BaseAgent):
             )
         context.metadata = {"flashrsi_trajectory": "flashrsi.json"}
         if result.return_code:
+            trace_path = self.logs_dir / "flashrsi.json"
+            if native and trace_path.is_file():
+                payload = json.loads(trace_path.read_text())
+                payload.pop("task", None)
+                if reason := trajectory_infra_reason(Trajectory(**payload)):
+                    raise InfraError(reason)
             # Harbor continues the verifier for this exception, preserving task
             # feedback even when the harness has failed or reached its timeout.
             raise NonZeroAgentExitCodeError(

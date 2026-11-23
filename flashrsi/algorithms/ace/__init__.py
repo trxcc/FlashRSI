@@ -56,6 +56,8 @@ class ACE(Algorithm):
         "max_steps": None,
         "edit_budget": 4,
         "eval_steps": 100,
+        "val_repeats": 0,
+        "min_val_gain": 0.0,
         "max_reflection_rounds": 3,
         "curator_frequency": 1,
         "playbook_token_budget": 80000,
@@ -70,6 +72,8 @@ class ACE(Algorithm):
         "max_steps": (int | None, 1),
         "edit_budget": (int, 1),
         "eval_steps": (int, 1),
+        "val_repeats": (int, 0),
+        "min_val_gain": (float, 0),
         "max_reflection_rounds": (int, 1),
         "curator_frequency": (int, 1),
         "playbook_token_budget": (int, 1),
@@ -84,8 +88,10 @@ class ACE(Algorithm):
         self._prefix, _, self._playbook = text.partition(_MARKER)
         self._rejected, self._streamed = [], []
         offline = self.config.mode == "offline"
-        if offline:
+        validation = offline or self.config.val_repeats > 0
+        if validation:
             self._best, self._best_score = current, float("-inf")
+            self._best_correctness = None
             await self._validate(current)
 
         stream = islice(self._batches(), self.config.max_steps)
@@ -106,7 +112,7 @@ class ACE(Algorithm):
                     current = await self._curate(current, reflection, batch, step)
             # Validation belongs to the schedule, even when curation is skipped
             # or declined. A counter-only update is still a different context.
-            if offline and step % self.config.eval_steps == 0:
+            if validation and step % self.config.eval_steps == 0:
                 await self._validate(current)
 
         if not offline:
@@ -124,7 +130,8 @@ class ACE(Algorithm):
                     "online_tasks": len(self._streamed),
                 },
             )
-            return current
+            if not validation:
+                return current
         if self._validated_id != current.id:
             await self._validate(current)
         return self._promote(current, self._best, score=self._best_score)
@@ -245,13 +252,65 @@ class ACE(Algorithm):
         return candidate
 
     async def _validate(self, current):
-        score = (
-            await self._evaluate(current, self.benchmark.dev, label="validation")
-        ).score
+        repeats = self.config.val_repeats or 1
+        results = [
+            await self._evaluate(
+                current,
+                self.benchmark.dev,
+                label="validation" if repeats == 1 else f"validation-{repeat + 1}",
+            )
+            for repeat in range(repeats)
+        ]
+        if getattr(self.benchmark, "name", None) == "harvey_workspace" and any(results):
+            from flashrsi.benchmarks.workspace_suite import summarize_harvey
+
+            score = summarize_harvey(
+                row.metrics for result in results for row in result
+            )["micro_avg"]
+        else:
+            score = mean(result.score for result in results)
+        correctness = None
+        if getattr(self.benchmark, "name", None) == "kernelbench":
+            correct_speed = []
+            for result in results:
+                for row in result:
+                    receipts = row.messages[-1].get("trial_receipts", ())
+                    valid = [
+                        receipt["speedup"]
+                        for receipt in receipts
+                        if receipt.get("correct") is True
+                    ]
+                    correct_speed.append((bool(valid), max(valid, default=0.0)))
+            correctness = mean(correct for correct, _ in correct_speed)
+            score = mean(speed for _, speed in correct_speed)
+
         self._validated_id = current.id
-        # Equal dev scores retain the previously selected playbook.
-        if score > self._best_score:
-            self._best, self._best_score = current, score
+        non_regression = (
+            self._best_correctness is None or correctness >= self._best_correctness
+        )
+        improvement = score - self._best_score
+        accepted = (
+            non_regression
+            and improvement > 0
+            and improvement >= self.config.min_val_gain
+        )
+        if accepted:
+            self._best, self._best_score, self._best_correctness = (
+                current,
+                score,
+                correctness,
+            )
+        if self.config.val_repeats:
+            self._record(
+                "validation-gate",
+                {
+                    "snapshot_id": current.id,
+                    "score": score,
+                    "correctness": correctness,
+                    "repeats": repeats,
+                    "accepted": accepted,
+                },
+            )
 
     def _render_evidence(self, batch):
         # Only training attempts reach the Worker. Ground truth is feedback to
@@ -273,8 +332,13 @@ class ACE(Algorithm):
         if not self.benchmark.train:
             raise ValueError("ACE requires a non-empty train split")
         # Only offline validates, so only offline needs somewhere to validate.
-        if self.config.mode == "offline" and not self.benchmark.dev:
-            raise ValueError("offline ACE requires a non-empty dev split")
+        if not self.benchmark.dev:
+            if self.config.mode == "offline":
+                raise ValueError("offline ACE requires a non-empty dev split")
+            if self.config.val_repeats and not self.benchmark.config.get(
+                "smoke", False
+            ):
+                raise ValueError("ACE validation requires a non-empty dev split")
         self._path = self._instruction_path()
         if self.config.max_reflection_rounds > 1 and any(
             task.env is not None for task in self.benchmark.train

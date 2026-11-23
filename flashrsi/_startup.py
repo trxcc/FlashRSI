@@ -1,4 +1,10 @@
-"""Runner startup checks for prerequisites not covered by native bind/load calls."""
+"""Validate startup prerequisites before binding benchmarks and agents.
+
+The host checks local data paths, provider configuration, optional packages,
+and Docker availability. Benchmark integrations handle task-specific setup.
+"""
+
+from __future__ import annotations
 
 import importlib.util
 import os
@@ -7,12 +13,18 @@ import sys
 from collections.abc import Mapping
 from importlib.metadata import version
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
+from flashrsi.benchmarks import _suite
 from flashrsi.integrations._docker import _docker
+
+if TYPE_CHECKING:
+    from flashrsi.config import Config
 
 _HARBOR = {
     "terminal_bench",
+    "tb21_clean",
     "jobbench",
     "swe_bench_pro",
     "spreadsheetbench2",
@@ -39,7 +51,7 @@ _CONTAINERS = _HARBOR | {
 }
 
 
-def _supplied_context(benchmark):
+def _supplied_context(benchmark: Config) -> bool:
     return benchmark.name in {
         "searchqa",
         "musique",
@@ -55,11 +67,13 @@ def _supplied_context(benchmark):
     )
 
 
-def _requires_docker(benchmark):
-    return benchmark.name in _CONTAINERS or _supplied_context(benchmark)
+def _requires_docker(benchmark: Config) -> bool:
+    return benchmark.name in (_CONTAINERS | _suite.ACTIVE) or _supplied_context(
+        benchmark
+    )
 
 
-async def _preflight(config):
+async def _preflight(config: Config) -> None:
     benchmark = config.benchmark
     name = benchmark.name
     # Role mappings and lists keep their loader semantics. Only existence is
@@ -122,7 +136,7 @@ async def _preflight(config):
             _url(url, label + ".llm.base_url")
 
 
-def _role(config, label, kind):
+def _role(config: Mapping[str, Any], label: str, kind: str) -> None:
     llm = config["llm"]
     if kind == "claude_code":
         from flashrsi.agents.claude_code import _authentication_env
@@ -177,7 +191,7 @@ def _role(config, label, kind):
         _url(llm["base_url"], label + ".llm.base_url")
 
 
-def _url(value, label):
+def _url(value: Any, label: str) -> None:
     try:
         if not isinstance(value, str):
             raise ValueError
@@ -194,7 +208,7 @@ def _url(value, label):
         raise ValueError(f"{label} must be an absolute HTTP(S) URL")
 
 
-def _module(name, extra):
+def _module(name: str, extra: str) -> None:
     try:
         present = importlib.util.find_spec(name) is not None
     except (ImportError, ModuleNotFoundError, ValueError):
@@ -203,7 +217,7 @@ def _module(name, extra):
         raise ValueError(f"Missing {name}; install flashrsi-lite[{extra}]")
 
 
-def _paths(value, label):
+def _paths(value: Any, label: str) -> None:
     if isinstance(value, Mapping):
         for key, child in value.items():
             _paths(child, f"{label}.{key}")
@@ -218,7 +232,7 @@ def _paths(value, label):
         )
 
 
-async def _check_docker(name, benchmark, *, images=True):
+async def _check_docker(name: str, benchmark: Config, *, images: bool = True) -> None:
     if shutil.which("docker") is None:
         raise ValueError("Install Docker CLI and start a Linux daemon; see README.md")
     try:

@@ -1,4 +1,8 @@
-"""Command-line configuration and experiment preparation."""
+"""Parse experiment options and dispatch host-side workflows.
+
+The CLI validates suite access before importing the runner or preparing an
+experiment directory. Dotted overrides use the same YAML loader as profiles.
+"""
 
 from __future__ import annotations
 
@@ -13,7 +17,8 @@ from typing import Any
 import yaml
 
 from flashrsi._records import _redact, _secrets
-from flashrsi.config import _ConfigLoader, load_config, prepare_run_dir
+from flashrsi.benchmarks._suite import guard
+from flashrsi.config import Config, _ConfigLoader, load_config, prepare_run_dir
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -25,6 +30,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     args, unknown = parser.parse_known_args(normalized)
     if unknown:
         parser.error("Unrecognized arguments; use 'flashrsi run --help' for usage.")
+    config = _validated_config(parser, args)
+    if args.command == "evaluate":
+        return _evaluate_command(parser, args, config)
+    smoke = config.run.get("smoke", False)
+    if args.limit is not None and not smoke:
+        parser.error("--limit requires --smoke")
+    if args.prepare_only:
+        return _prepare_command(parser, config)
+    return _run_command(parser, args, config, smoke=smoke)
+
+
+def _validated_config(
+    parser: argparse.ArgumentParser, args: argparse.Namespace
+) -> Config:
     try:
         config = load_config(args.config, overrides=_overrides(args))
     except ValueError as exc:
@@ -34,53 +53,75 @@ def main(argv: Sequence[str] | None = None) -> int:
     except OSError as exc:
         parser.error(str(exc))
 
-    if args.command == "evaluate":
-        from flashrsi.runner import _evaluate, _prepare_evaluation
+    try:
+        guard(config.benchmark)
+    except PermissionError as exc:
+        parser.error(f"PermissionError: {exc}")
+    return config
 
-        try:
-            if args.check_only:
-                target, benchmark = asyncio.run(_prepare_evaluation(config))
-                print(
-                    f"Evaluation checks passed: snapshot={target.snapshot.id}, test={len(benchmark.test)}"
-                )
-                print(
-                    "No model calls or experiment directory created; remote APIs were not tested."
-                )
-                return 0
-            run_dir, result = asyncio.run(_evaluate(config))
-        except Exception as exc:
-            parser.error(_redact(str(exc), _secrets(config) + _secrets(os.environ)))
-        print(f"Completed evaluation: {run_dir}")
-        print(f"Snapshot: {result['snapshot_id']}")
-        print(f"Test {result['primary_metric']}: {result['test_score']}")
-        return 0
 
-    if not args.prepare_only:
-        from flashrsi.runner import _prepare, _run
+def _evaluate_command(
+    parser: argparse.ArgumentParser,
+    args: argparse.Namespace,
+    config: Config,
+) -> int:
+    from flashrsi.runner import _evaluate, _prepare_evaluation
 
-        try:
-            if args.check_only:
-                algorithm = asyncio.run(_prepare(config))
-                counts = ", ".join(
-                    f"{role}={len(getattr(algorithm.benchmark, role))}"
-                    for role in ("train", "dev", "test")
-                )
-                print(f"Startup checks passed: {counts}")
-                print(
-                    "No tasks or model calls were run; no experiment directory created."
-                )
-                print(
-                    "Remote API authentication and model availability were not tested."
-                )
-                return 0
-            run_dir, result = asyncio.run(_run(config))
-        except Exception as exc:
-            parser.error(_redact(str(exc), _secrets(config) + _secrets(os.environ)))
-        print(f"Completed experiment: {run_dir}")
-        print(f"Snapshot: {result['snapshot_id']}")
-        print(f"Test {result['primary_metric']}: {result['test_score']}")
-        return 0
+    try:
+        if args.check_only:
+            target, benchmark = asyncio.run(_prepare_evaluation(config))
+            print(
+                f"Evaluation checks passed: snapshot={target.snapshot.id}, test={len(benchmark.test)}"
+            )
+            print(
+                "No model calls or experiment directory created; remote APIs were not tested."
+            )
+            return 0
+        run_dir, result = asyncio.run(_evaluate(config))
+    except Exception as exc:
+        parser.error(_redact(str(exc), _secrets(config) + _secrets(os.environ)))
+    print(f"Completed evaluation: {run_dir}")
+    print(f"Snapshot: {result['snapshot_id']}")
+    print(f"Test {result['primary_metric']}: {result['test_score']}")
+    return 0
 
+
+def _run_command(
+    parser: argparse.ArgumentParser,
+    args: argparse.Namespace,
+    config: Config,
+    *,
+    smoke: bool,
+) -> int:
+    from flashrsi.runner import _prepare, _run, _smoke
+
+    try:
+        if args.check_only:
+            algorithm = asyncio.run(_prepare(config))
+            counts = ", ".join(
+                f"{role}={len(getattr(algorithm.benchmark, role))}"
+                for role in ("train", "dev", "test")
+            )
+            print(f"Startup checks passed: {counts}")
+            print("No tasks or model calls were run; no experiment directory created.")
+            print("Remote API authentication and model availability were not tested.")
+            return 0
+        if smoke:
+            run_dir, result = asyncio.run(_smoke(config, args.limit))
+            for task in result["tasks"]:
+                print(f"{task['task_id']}: {task['metrics'][result['primary_metric']]}")
+            print(f"Completed smoke: {run_dir}")
+            return 0
+        run_dir, result = asyncio.run(_run(config))
+    except Exception as exc:
+        parser.error(_redact(str(exc), _secrets(config) + _secrets(os.environ)))
+    print(f"Completed experiment: {run_dir}")
+    print(f"Snapshot: {result['snapshot_id']}")
+    print(f"Test {result['primary_metric']}: {result['test_score']}")
+    return 0
+
+
+def _prepare_command(parser: argparse.ArgumentParser, config: Config) -> int:
     try:
         run_dir = prepare_run_dir(config)
     except (OSError, ValueError) as exc:
@@ -107,9 +148,7 @@ def _parser() -> argparse.ArgumentParser:
         sub.add_argument(
             "--config", "-c", metavar="PATH", help="Read configuration from YAML"
         )
-        sub.add_argument(
-            "--benchmark", metavar="NAME", help="Override benchmark.name"
-        )
+        sub.add_argument("--benchmark", metavar="NAME", help="Override benchmark.name")
         sub.add_argument(
             "--agent-harness",
             "--agent",
@@ -136,23 +175,7 @@ def _parser() -> argparse.ArgumentParser:
             help="Check startup without model calls; may download native data",
         )
         if command == "run":
-            sub.add_argument(
-                "--algorithm",
-                "--algo",
-                dest="algorithm",
-                metavar="NAME",
-                help="Override algorithm.name",
-            )
-            sub.add_argument(
-                "--worker-model",
-                metavar="NAME",
-                help="Override algorithm.worker.llm.model_name",
-            )
-            preparation.add_argument(
-                "--prepare-only",
-                action="store_true",
-                help="Create a configuration directory without checking runtime readiness",
-            )
+            _run_options(sub, preparation)
         else:
             sub.add_argument(
                 "--snapshot",
@@ -161,6 +184,36 @@ def _parser() -> argparse.ArgumentParser:
                 help="Saved Snapshot JSON, relative to the working directory",
             )
     return parser
+
+
+def _run_options(
+    parser: argparse.ArgumentParser, preparation: argparse._MutuallyExclusiveGroup
+) -> None:
+    preparation.add_argument(
+        "--smoke",
+        action="store_true",
+        help="Run a reviewed suite train/dev task with native grading",
+    )
+    parser.add_argument(
+        "--limit", type=int, help="Limit active tasks selected by --smoke"
+    )
+    parser.add_argument(
+        "--algorithm",
+        "--algo",
+        dest="algorithm",
+        metavar="NAME",
+        help="Override algorithm.name",
+    )
+    parser.add_argument(
+        "--worker-model",
+        metavar="NAME",
+        help="Override algorithm.worker.llm.model_name",
+    )
+    preparation.add_argument(
+        "--prepare-only",
+        action="store_true",
+        help="Create a configuration directory without checking runtime readiness",
+    )
 
 
 def _dotted_args(argv: Sequence[str]) -> list[str]:
@@ -229,6 +282,8 @@ def _overrides(args: argparse.Namespace) -> dict[str, Any]:
     result.setdefault("run", {})["mode"] = (
         "evaluate" if args.command == "evaluate" else "run"
     )
+    if getattr(args, "smoke", False):
+        result["run"]["smoke"] = True
     if args.command == "evaluate":
         result["run"]["snapshot"] = str(Path(args.snapshot).expanduser().resolve())
     return result

@@ -1,16 +1,31 @@
-"""Instantiate components, run evolution, and save the final held-out result."""
+"""Prepare benchmark-bound agents and run search or frozen evaluation.
+
+The host owns model roles, run directories, and score summaries. Native suite
+assets and integration dependencies are resolved only for the selected run.
+"""
 
 from __future__ import annotations
 
 import copy
 import importlib.util
 import logging
+import os
 from pathlib import Path
-from statistics import mean
 from types import MappingProxyType
+from typing import Any
 
 from flashrsi._records import _trajectory_record, _write_record
 from flashrsi._run_summary import _finish_summary
+from flashrsi._suite_runner import (
+    HARBOR_NAMES,
+    SUITE_BENCHMARKS,
+    _aggregate_metrics,
+    _execution_config,
+    _harvey_validation_metrics,
+    _smoke_tasks,
+    bind_suite,
+    suite_target_config,
+)
 from flashrsi.agents import (
     LLM,
     ClaudeCode,
@@ -22,6 +37,7 @@ from flashrsi.agents import (
     OpenCode,
     Pi,
 )
+from flashrsi.agents.program_search import ProgramSearchTarget
 from flashrsi.algorithms import (
     ACE,
     ADAS,
@@ -38,6 +54,7 @@ from flashrsi.algorithms import (
     SkillAdam,
     SkillOpt,
 )
+from flashrsi.algorithms.promotion import SequentialMemory, TwoGateWorkspacePromotion
 from flashrsi.benchmarks import (
     AIME,
     BBEH,
@@ -70,11 +87,15 @@ from flashrsi.benchmarks import (
     WebShop,
     WideSearch,
     WorkBench,
+    _suite,
 )
-from flashrsi.config import prepare_run_dir
-from flashrsi.core import Agent, Snapshot
+from flashrsi.config import Config, prepare_run_dir
+from flashrsi.core import Agent, Algorithm, Benchmark, Snapshot, Trajectory
+from flashrsi.integrations.sandbox_runtime import RELAY_PLACEHOLDER
 
 _AGENTS = {
+    "program_search": ProgramSearchTarget,
+    "pi_agent": Pi,
     "jiuwenswarm": JiuwenSwarm,
     "miniagent": MiniAgent,
     "claude_code": ClaudeCode,
@@ -85,6 +106,7 @@ _AGENTS = {
     "opencode": OpenCode,
 }
 _BENCHMARKS = {
+    **SUITE_BENCHMARKS,
     "webshop": WebShop,
     "alfworld": ALFWorld,
     "tau2": Tau2Benchmark,
@@ -118,6 +140,8 @@ _BENCHMARKS = {
     "tau3_banking": Tau3Banking,
 }
 _ALGORITHMS = {
+    "two_gate_workspace": TwoGateWorkspacePromotion,
+    "sequential_memory": SequentialMemory,
     "arbor": Arbor,
     "adas": ADAS,
     "darwinx": DarwinX,
@@ -133,10 +157,27 @@ _ALGORITHMS = {
     "gepa": GEPA,
     "evoprompt": EvoPrompt,
 }
+_BENCHMARK_BINDINGS = (
+    (ALFWorld, "alfworld"),
+    (WebShop, "webshop"),
+    (WorkBench, "workbench"),
+    (TravelPlanner, "travelplanner"),
+    (HarveyLAB, "harvey_lab"),
+    (WideSearch, "widesearch"),
+    (DeepSearchQA, "deepsearchqa"),
+    (BrowseComp, "browsecomp"),
+    (LiveMathBench, "livemathbench"),
+    (HLE, "hle"),
+    (OfficeQAPro, "officeqa_pro"),
+    (SWEBench, "swe_bench"),
+    (DeepSWE, "deepswe"),
+    (JobBench, "jobbench"),
+    (SWEBenchPro, "swe_bench_pro"),
+)
 _LOGGER = logging.getLogger(__name__)
 
 
-def _make_agent(cls, section, label):
+def _make_agent(cls: type[Agent], section: Config, label: str) -> Agent:
     from flashrsi._startup import _role
 
     dependencies = {
@@ -162,14 +203,21 @@ def _make_agent(cls, section, label):
     return cls(section)
 
 
-async def _prepare_target(config, *, snapshot=None):
+async def _prepare_target(
+    config: Config,
+    *,
+    snapshot: Snapshot | None = None,
+    smoke: bool | None = None,
+) -> tuple[Agent, Benchmark]:
     """Share benchmark bindings between search and frozen-Snapshot evaluation."""
-    from flashrsi._startup import _preflight, _supplied_context
+    config = _execution_config(config, smoke=smoke)
+    from flashrsi._startup import _preflight
+    from flashrsi.benchmarks import _prepared
 
     await _preflight(config)
-    target = _make_agent(
-        _lookup(_AGENTS, config.agent.name, "agent"), config.agent, "agent"
-    )
+    native = config.benchmark.name in _suite.ACTIVE
+    section = suite_target_config(config.agent, native=native)
+    target = _make_agent(_lookup(_AGENTS, section.name, "agent"), section, "agent")
     if snapshot is not None:
         try:
             target.update(snapshot)
@@ -178,109 +226,17 @@ async def _prepare_target(config, *, snapshot=None):
                 f"Cannot evaluate this Snapshot: {exc}. Use the original Agent type and "
                 "root source tree (agent.source_dir); evaluation does not rebase snapshots."
             ) from exc
-    from flashrsi.benchmarks import _prepared
-
     prepared = _prepared.selected(config.benchmark)
     if prepared:
         config = copy.deepcopy(config)
         config.benchmark = _prepared.prepare(config.benchmark)
-    # Bind the task environment to the selected harness, including any evolved
-    # tool/config changes. A benchmark must not silently install another version.
     selected = target.snapshot.id
     benchmark = _lookup(_BENCHMARKS, config.benchmark.name, "benchmark")(
         config.benchmark
     )
-    if isinstance(benchmark, ALFWorld):
-        from flashrsi.integrations.alfworld import bind
-
-        bind(target, benchmark)
-    if isinstance(benchmark, WebShop):
-        from flashrsi.integrations.webshop import bind
-
-        bind(target, benchmark)
-    if isinstance(benchmark, WorkBench):
-        from flashrsi.integrations.workbench import bind
-
-        bind(target, benchmark)
-    if isinstance(benchmark, TravelPlanner):
-        from flashrsi.integrations.travelplanner import bind
-
-        bind(target, benchmark)
-    if isinstance(benchmark, HarveyLAB):
-        from flashrsi.integrations.harvey_lab import bind
-
-        bind(target, benchmark)
-    if isinstance(benchmark, WideSearch):
-        from flashrsi.integrations.widesearch import bind
-
-        bind(target, benchmark)
-    if isinstance(benchmark, DeepSearchQA):
-        from flashrsi.integrations.deepsearchqa import bind
-
-        bind(target, benchmark)
-    if isinstance(benchmark, BrowseComp):
-        from flashrsi.integrations.browsecomp import bind
-
-        bind(target, benchmark)
-    if _supplied_context(config.benchmark):
-        from flashrsi.integrations.supplied_context import bind
-
-        bind(target)
-    if isinstance(benchmark, HotpotQA) and benchmark.mode == "fullwiki":
-        from flashrsi.integrations.hotpotqa import bind
-
-        bind(target, benchmark)
-    if isinstance(benchmark, MATH):
-        benchmark._check()
-    if isinstance(benchmark, LiveMathBench):
-        from flashrsi.integrations.livemathbench import bind
-
-        bind(target, benchmark)
-    if isinstance(benchmark, HLE):
-        from flashrsi.integrations.hle import bind
-
-        bind(target, benchmark)
-    if isinstance(benchmark, OfficeQAPro):
-        from flashrsi.integrations.officeqa_pro import bind
-
-        bind(target, benchmark)
-    if isinstance(benchmark, SWEBench):
-        from flashrsi.integrations.swe_bench import bind
-
-        bind(target, benchmark)
-    if isinstance(benchmark, BFCL):
-        from flashrsi.integrations.bfcl import bind
-
-        bind(target, config.benchmark)
-    if isinstance(benchmark, AppWorldBenchmark):
-        from flashrsi.integrations.appworld import bind
-
-        bind(target, config.benchmark)
-    if isinstance(benchmark, (TerminalBench, SpreadsheetBench2)):
-        from flashrsi.integrations.harbor import bind
-
-        bind(target)
-    if isinstance(benchmark, DeepSWE):
-        from flashrsi.integrations.deepswe import bind
-
-        bind(target, benchmark)
-    if isinstance(benchmark, JobBench):
-        from flashrsi.integrations.jobbench import bind
-
-        bind(target, benchmark)
-    if isinstance(benchmark, SWEBenchPro):
-        from flashrsi.integrations.swe_bench_pro import bind
-
-        bind(target, benchmark)
-    if isinstance(benchmark, (Tau2Benchmark, Tau3Banking)):
-        from flashrsi.integrations.tau2 import bind
-
-        bind(
-            target,
-            config.benchmark.get("user_simulator"),
-            task_timeout=config.benchmark.get("task_timeout"),
-            judge=config.benchmark.get("judge"),
-        )
+    if native:
+        bind_suite(target, benchmark)
+    _bind_benchmark(target, benchmark, config.benchmark)
     if target.snapshot.id != selected:
         raise ValueError(
             f"{benchmark.name} integration replaced the selected harness Snapshot; "
@@ -294,12 +250,58 @@ async def _prepare_target(config, *, snapshot=None):
     return target, benchmark
 
 
-async def _prepare(config):
+def _bind_benchmark(target: Agent, benchmark: Benchmark, config: Config) -> None:
+    from flashrsi._startup import _supplied_context
+
+    # These integrations bind the same target/benchmark pair. Keep imports
+    # local to the selected benchmark to avoid loading other optional stacks.
+    for benchmark_type, module in _BENCHMARK_BINDINGS:
+        if isinstance(benchmark, benchmark_type):
+            importlib.import_module(f"flashrsi.integrations.{module}").bind(
+                target, benchmark
+            )
+    if _supplied_context(config):
+        from flashrsi.integrations.supplied_context import bind
+
+        bind(target)
+    if isinstance(benchmark, HotpotQA) and benchmark.mode == "fullwiki":
+        from flashrsi.integrations.hotpotqa import bind
+
+        bind(target, benchmark)
+    if isinstance(benchmark, MATH):
+        benchmark._check()
+    if isinstance(benchmark, (BFCL, AppWorldBenchmark)):
+        module = "bfcl" if isinstance(benchmark, BFCL) else "appworld"
+        importlib.import_module(f"flashrsi.integrations.{module}").bind(target, config)
+    if isinstance(benchmark, (TerminalBench, SpreadsheetBench2)):
+        from flashrsi.integrations.harbor import bind
+
+        bind(target)
+    if isinstance(benchmark, (Tau2Benchmark, Tau3Banking)):
+        from flashrsi.integrations.tau2 import bind
+
+        bind(
+            target,
+            config.get("user_simulator"),
+            task_timeout=config.get("task_timeout"),
+            judge=config.get("judge"),
+        )
+
+
+async def _prepare(config: Config, *, smoke: bool | None = None) -> Algorithm:
     """Initialize search, including its independent Worker and algorithm checks."""
+    config = _execution_config(config, smoke=smoke)
     algorithm_type = _lookup(_ALGORITHMS, config.algorithm.name, "algorithm")
     worker_config = config.algorithm.worker
-    if worker_config.type == "agent" and worker_config.name == "jiuwenswarm":
-        raise ValueError("JiuwenSwarm is available as a Target only")
+    _suite.guard(config.benchmark)
+    if config.benchmark.name in _suite.ACTIVE:
+        worker_config = copy.deepcopy(worker_config)
+        worker_config.llm.api_key = os.getenv("DEEPSEEK_API_KEY") or RELAY_PLACEHOLDER
+    if worker_config.type == "agent" and worker_config.name in {
+        "jiuwenswarm",
+        "program_search",
+    }:
+        raise ValueError("Selected agent is available as a Target only")
     worker_type = (
         LLM
         if worker_config.type == "llm"
@@ -313,7 +315,10 @@ async def _prepare(config):
     return algorithm
 
 
-async def _run(config):
+async def _run(config: Config) -> tuple[Path, dict[str, Any]]:
+    config = _execution_config(config)
+    if config.run.get("smoke", False):
+        return await _smoke(config)
     algorithm = await _prepare(config)
     worker, benchmark = algorithm.worker, algorithm.benchmark
     resolved = copy.deepcopy(config)
@@ -327,23 +332,20 @@ async def _run(config):
             worker.snapshot.save(run_dir / "snapshots" / "worker.json")
         final = await algorithm.evolve()
         results = await algorithm._evaluate(final, benchmark.test, label="test")
+        metrics = _aggregate_metrics(results)
         summary = {
             "status": "finished",
             "snapshot_id": final.id,
             "primary_metric": benchmark.primary_metric,
-            "test_score": mean(
-                item.metrics[benchmark.primary_metric] for item in results
-            )
-            if results
-            else None,
+            "test_score": metrics.get(benchmark.primary_metric),
             "test_tasks": len(results),
-            "test_metrics": {
-                name: mean(item.metrics[name] for item in results)
-                for name in (results[0].metrics if results else ())
-                if all(name in item.metrics for item in results)
-            },
+            "test_metrics": metrics,
             "benchmark": dict(benchmark.metadata),
         }
+        if config.benchmark.name in {"harvey_workspace", "workspace_dualgate"}:
+            validation = _harvey_validation_metrics(run_dir, final.id)
+            if validation:
+                summary["validation_metrics"] = validation
         _write_record(run_dir / "result.json", summary, config)
     except BaseException as exc:
         _write_record(
@@ -366,10 +368,10 @@ def _lookup(choices, name, role):
         ) from None
 
 
-def _artifact_paths(target, benchmark, run_dir):
+def _artifact_paths(target: Agent, benchmark: Benchmark, run_dir: Path) -> None:
     if isinstance(benchmark, HarveyLAB) and benchmark._artifacts_dir is None:
         benchmark._artifacts_dir = run_dir / "artifacts" / "harvey_lab"
-    if isinstance(
+    if benchmark.name in HARBOR_NAMES or isinstance(
         benchmark, (TerminalBench, SpreadsheetBench2, DeepSWE, JobBench, SWEBenchPro)
     ):
         target.config.setdefault("harbor", {}).setdefault(
@@ -377,7 +379,7 @@ def _artifact_paths(target, benchmark, run_dir):
         )
 
 
-async def _prepare_evaluation(config):
+async def _prepare_evaluation(config: Config) -> tuple[Agent, Benchmark]:
     snapshot = Snapshot.load(Path(config.run.snapshot))
     target, benchmark = await _prepare_target(config, snapshot=snapshot)
     target.set_scope({name: "r" for name in target.component_rules})
@@ -397,7 +399,7 @@ async def _prepare_evaluation(config):
     return target, benchmark
 
 
-async def _evaluate(config):
+async def _evaluate(config: Config) -> tuple[Path, dict[str, Any]]:
     """Evaluate a saved resource version without constructing a Worker or Algorithm."""
     target, benchmark = await _prepare_evaluation(config)
     snapshot = target.snapshot
@@ -417,41 +419,17 @@ async def _evaluate(config):
             {"source": source, "benchmark": dict(benchmark.metadata), "split": "test"},
             config,
         )
-        trajectories = await target.rollout(benchmark.test)
-        # Preserve completed requests even when grading fails.
-        _write_record(
-            run_dir / "trajectories" / "000001-rollout.json",
-            {
-                "snapshot_id": snapshot.id,
-                "trajectories": [_trajectory_record(t) for t in trajectories],
-            },
-            config,
-        )
-        results = benchmark.grade(trajectories)
-        if tuple(t.task for t in results) != tuple(benchmark.test):
-            raise ValueError(
-                "rollout/grade must preserve the requested tasks and order"
-            )
-        record = {
-            "snapshot_id": snapshot.id,
-            "trajectories": [_trajectory_record(t) for t in results],
-        }
-        _write_record(run_dir / "trajectories" / "000002-test.json", record, config)
-        # The scored record supersedes its raw copy for usage accounting.
-        (run_dir / "trajectories" / "000001-rollout.json").unlink()
+        results = await _grade_evaluation(config, target, benchmark, run_dir)
+        metrics = _aggregate_metrics(results)
         summary = {
             "status": "finished",
             "mode": "evaluate",
             "source": source,
             "snapshot_id": snapshot.id,
             "primary_metric": benchmark.primary_metric,
-            "test_score": mean(t.metrics[benchmark.primary_metric] for t in results),
+            "test_score": metrics[benchmark.primary_metric],
             "test_tasks": len(results),
-            "test_metrics": {
-                name: mean(t.metrics[name] for t in results)
-                for name in results[0].metrics
-                if all(name in t.metrics for t in results)
-            },
+            "test_metrics": metrics,
             "benchmark": dict(benchmark.metadata),
         }
         _write_record(run_dir / "result.json", summary, config)
@@ -470,3 +448,80 @@ async def _evaluate(config):
     finally:
         _finish_summary(run_dir)
     return run_dir, summary
+
+
+async def _grade_evaluation(
+    config: Config,
+    target: Agent,
+    benchmark: Benchmark,
+    run_dir: Path,
+) -> tuple[Trajectory, ...]:
+    snapshot = target.snapshot
+    trajectories = await target.rollout(benchmark.test)
+    # Preserve completed requests even when grading fails.
+    _write_record(
+        run_dir / "trajectories" / "000001-rollout.json",
+        {
+            "snapshot_id": snapshot.id,
+            "trajectories": [_trajectory_record(t) for t in trajectories],
+        },
+        config,
+    )
+    results = benchmark.grade(trajectories)
+    if tuple(t.task for t in results) != tuple(benchmark.test):
+        raise ValueError("rollout/grade must preserve the requested tasks and order")
+    record = {
+        "snapshot_id": snapshot.id,
+        "trajectories": [_trajectory_record(t) for t in results],
+    }
+    _write_record(run_dir / "trajectories" / "000002-test.json", record, config)
+    # The scored record supersedes its raw copy for usage accounting.
+    (run_dir / "trajectories" / "000001-rollout.json").unlink()
+    return results
+
+
+async def _smoke(
+    config: Config, limit: int | None = None
+) -> tuple[Path, dict[str, Any]]:
+    """Grade an explicit train/dev slice through the ordinary target bindings."""
+    config = _execution_config(config, smoke=True, limit=limit)
+    target, benchmark = await _prepare_target(config)
+    benchmark.load()
+    tasks = _smoke_tasks(config, benchmark)
+    run_dir = prepare_run_dir(config)
+    _artifact_paths(target, benchmark, run_dir)
+    try:
+        target.snapshot.save(run_dir / "snapshots" / f"{target.snapshot.id}.json")
+        trajectories = benchmark.grade(await target.rollout(tasks))
+        _write_record(
+            run_dir / "trajectories/000001-smoke.json",
+            {"trajectories": [_trajectory_record(item) for item in trajectories]},
+            config,
+        )
+        summary = {
+            "status": "finished",
+            "mode": "smoke",
+            "snapshot_id": target.snapshot.id,
+            "primary_metric": benchmark.primary_metric,
+            "benchmark": dict(benchmark.metadata),
+            "metrics": _aggregate_metrics(trajectories),
+            "tasks": [
+                {
+                    "task_id": row.task.task_id,
+                    "status": row.status,
+                    "metrics": dict(row.metrics),
+                }
+                for row in trajectories
+            ],
+        }
+        _write_record(run_dir / "result.json", summary, config)
+        return run_dir, summary
+    except BaseException as exc:
+        _write_record(
+            run_dir / "error.json",
+            {"status": "error", "type": type(exc).__name__, "message": str(exc)},
+            config,
+        )
+        raise
+    finally:
+        _finish_summary(run_dir)
